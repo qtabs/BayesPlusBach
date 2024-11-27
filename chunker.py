@@ -79,7 +79,7 @@ class Chunker():
 			t0, t1 = self.t0[n], self.t0[n] + self.chunk_size
 			target[n, :, :] = self.songs_dict[self.song_list[n]]['target'][t0:t1]
 			sample[n, :, :] = self.songs_dict[self.song_list[n]]['sample'][t0:t1]
-			if t1 == self.songs_dict[self.song_list[n]]['target'].shape[1]:
+			if t1 > self.songs_dict[self.song_list[n]]['target'].shape[1]-self.chunk_size:
 				self.song_list[n] = np.random.choice(self.song_pool)
 				self.t0[n] = 0
 			else:
