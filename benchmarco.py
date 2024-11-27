@@ -107,8 +107,8 @@ if __name__ == "__main__":
     # Store the scores
     final_scores = []
 
-    # for model, name in zip([rnn, gru, lstm, simple_pred, simple_inf], ("rnn", "gru", "lstm", "simplenn_pred", "simplenn_inf")):
-    for model, name in zip([simple_pred, simple_inf], ("simplenn_pred", "simplenn_inf")):
+    for model, name in zip([rnn, gru, lstm, simple_pred, simple_inf], ("rnn", "gru", "lstm", "simplenn_pred", "simplenn_inf")):
+    # for model, name in zip([simple_pred, simple_inf], ("simplenn_pred", "simplenn_inf")):
         # Train on prediction
 
         # Run the trainings:
