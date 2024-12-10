@@ -165,9 +165,6 @@ class Chunker():
 		return(sample_array)
 
 
-
-
-
 # Model object
 class Bachmodel():
 
@@ -179,10 +176,11 @@ class Bachmodel():
 
 		self.pars = pars
 		self.dev  = dev
-		self.chromatic  = pars['chromatic']
-		self.noise      = pars['noise']
-		self.train_path = os.path.join(pars['datapath'] , 'train')
-		self.test_path  = os.path.join(pars['datapath'] , 'test')
+		self.chromatic        = pars['chromatic']
+		self.noise            = pars['noise']
+		self.train_path       = os.path.join(pars['datapath'] , 'train')
+		self.validation_path  = os.path.join(pars['datapath'] , 'test')
+		self.test_path        = os.path.join(pars['datapath'] , 'test')
 
 		n_dim = 12 if self.chromatic else 108
 		n_layers  = pars['n_layers']
@@ -209,9 +207,9 @@ class Bachmodel():
 
 	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs']):
 		
-		chunker = Chunker(self.train_path, batch_size, chunk_size, 
-						  self.chromatic, self.noise, self.dev)
-
+		tolerance = 0.5 # loss < validation_loss + tol * std_validation_loss --> early stopping 
+		chunker = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
+  
 		# Select which parameters to train
 		parameters_to_train = []
 		for name, parameter in self.rnn.named_parameters():
@@ -224,6 +222,7 @@ class Bachmodel():
 
 		optimizer = optim.Adam(parameters_to_train, lr=lr)
 		loss_func = nn.BCELoss()
+		loss_hist = []
 
 		for batch in range(n_batches):
 			
@@ -241,32 +240,65 @@ class Bachmodel():
 			loss.backward()
 			optimizer.step()
 
+			loss_hist += [float(loss.detach().cpu().numpy())]
+
 			if batch % 10 == 0:
-				print(f"Batch {batch+1:02}/{n_batches} |  Loss: {loss:.4f}")
+				print(f"Batch {batch+1:03}/{n_batches} |  Loss: {loss:.4f}")
+				
+				# Early stopping if we begin to overfit the data when training RNNs
+				if 'rnn' not in freeze and batch > 0.05 * n_batches:
+					
+					ve = self.test(chunk_size, batch_size, 6, obj, self.validation_path)
+					valid_error_m, valid_error_s = np.mean(ve), np.std(ve)
+					cutoff = valid_error_m - tolerance * valid_error_s
+					cutoff_str  = f'{valid_error_m:.2f}' + u'\u00B1' + f'{valid_error_s:.2f}'
+					cutoff_str += f' (tol = {tolerance:.2f})'
 
-	def test(self, chunk_size, batch_size, n_samples, obj=['obs']):
+					avg_loss = np.mean(loss_hist[max(0, batch-10):])
+					
+					if avg_loss < cutoff:
+						print(f'Stopping -> <Loss> = {avg_loss:.2f}, val_loss = {cutoff_str}')
+						break
 
-		chunker = Chunker(self.test_path, batch_size, chunk_size, 
-						  self.chromatic, self.noise, self.dev)
+		self._write_report_(loss_hist, freeze, obj)
 
-		loss_func   = nn.BCELoss()
-		performance = np.zeros(n_samples)
+	def test(self, chunk_size, batch_size, n_samples=1, obj=['obs'], test_path=None):
+
+		if test_path is None:
+			test_path = self.test_path
+		chunker = Chunker(test_path, batch_size, chunk_size, self.chromatic, self.noise, self.dev)
+
+		loss_func   = nn.BCELoss(reduction='none')
+		performance = np.zeros((n_samples, batch_size))
 
 		with torch.no_grad():
 			
-			for n_sample in tqdm(range(n_samples)):	
+			for n_sample in (tqdm(range(n_samples)) if n_samples > 20  else range(n_samples)):	
 				target, sample = chunker.generate_chunk()
 				obs, pred = self.rnn(sample)
 
 				loss = 0
 				if 'obs' in obj:
-					loss += loss_func(obs, target)
+					loss += loss_func(obs, target).mean((1,2))
 				if 'pred' in obj:
-					loss += loss_func(pred[:, :-1], target[:, 1:])
+					loss += loss_func(pred[:, :-1], target[:, 1:]).mean((1,2))
 
-				performance[n_sample] = loss.cpu().numpy()				
+				performance[n_sample, :] = loss.cpu().numpy()		
 
 		return performance
+
+	def _write_report_(self, loss_hist, freeze, obj):
+
+		report_name = self.modname
+		report_name += f'_obj-{"-".join(obj)}_'
+		report_name += f'freeze-{"none" if freeze is None else "-".join(freeze)}'
+		report_path = os.path.join(os.path.split(self.modpath)[0], report_name) + '.txt'
+		history_str = ','.join([f'{l:.4f}' for l in loss_hist])
+
+		with open(report_path, 'w') as f:
+			f.write(history_str)
+
+
 
 
 ##############
