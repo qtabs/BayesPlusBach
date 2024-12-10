@@ -242,8 +242,9 @@ class Bachmodel():
 
 			loss_hist += [float(loss.detach().cpu().numpy())]
 
-			if batch % 10 == 0:
-				print(f"Batch {batch+1:03}/{n_batches} |  Loss: {loss:.4f}")
+			if batch % 25 == 0:
+
+				print(f"Batch {batch:04}/{n_batches} | Loss: {loss:.4f}")
 				
 				# Early stopping if we begin to overfit the data when training RNNs
 				if 'rnn' not in freeze and batch > 0.05 * n_batches:
@@ -297,11 +298,4 @@ class Bachmodel():
 
 		with open(report_path, 'w') as f:
 			f.write(history_str)
-
-
-
-
-##############
-
-
 
