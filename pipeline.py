@@ -186,6 +186,7 @@ def pipeline():
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
+
 def save_to_results(this_noise=None, this_n_hidden=None, **kwargs):
 
 	if not os.path.exists('./models/results.pickle'):
@@ -221,16 +222,18 @@ def plot_errors():
 
 	savedict = load_results()
 
-	noise, n_hidden = np.round(savedict['noise'], 2), savedict['n_hidden']
-	obs_m, obs_e, pred_m, pred_e = savedict['obs_m'], savedict['obs_e'], savedict['pred_m'], savedict['pred_e']
-	obs_high_m, obs_high_e   = savedict['obs_high_m'],  savedict['obs_high_e']
-	pred_high_m, pred_high_e = savedict['pred_high_m'], savedict['pred_high_e']
-	pred_mark_m, pred_mark_e = savedict['pred_mark_m'], savedict['pred_mark_e']
-	pred_low_m, pred_low_e   = savedict['pred_low_m'],  savedict['pred_low_e']
+	noise, n_hidden = savedict['noise'], savedict['n_hidden']
+	obs_m,        obs_e        = savedict['obs_err_m'],    savedict['obs_err_e'],
+	pred_m,       pred_e       = savedict['pred_err_m'],   savedict['pred_err_e']
+	obs_high_m,   obs_high_e   = savedict['obs_high_m'],   savedict['obs_high_e']
+	pred_high_m,  pred_high_e  = savedict['pred_high_m'],  savedict['pred_high_e']
+	pred_markl_m, pred_markl_e = savedict['pred_markl_m'], savedict['pred_markl_e']
+	pred_markh_m, pred_markh_e = savedict['pred_markh_m'], savedict['pred_markh_e']
+	pred_low_m,   pred_low_e   = savedict['pred_low_m'],   savedict['pred_low_e']
 
-	obs_n        = obs_m  - obs_high_m   / (.5*obs_e**2  + .5*obs_high_e**2 )**.5
-	pred_n       = pred_m - pred_high_m  / (.5*pred_e**2 + .5*pred_high_e**2)**.5
-	markov_imp_n = pred_m - pred_mark_m  / (.5*pred_e**2 + .5*pred_mark_e**2)**.5
+	obs_n        = obs_m  - obs_high_m    / (.5*obs_e**2  + .5*obs_high_e**2  )**.5
+	pred_n       = pred_m - pred_high_m   / (.5*pred_e**2 + .5*pred_high_e**2 )**.5
+	markov_imp_n = pred_m - pred_markl_m  / (.5*pred_e**2 + .5*pred_markl_e**2)**.5
 
 	d = (pred_m - obs_m) / (.5*obs_e**2 + .5*pred_e**2)**.5
 	D = (pred_m - obs_m)
@@ -253,7 +256,7 @@ def plot_errors():
 				annot=True, fmt='.2f', vmin=-10, vmax=0, ax=axs[2])
 	axs[2].set_ylabel('relative noise')
 	axs[2].set_ylabel('hidden units')
-	axs[2].set_title('d(prediction error - markovian bound)')
+	axs[2].set_title('d(prediction error - markovian low bound)')
 
 	fig.subplots_adjust(left=0.07, bottom=0.05, right=0.99, top=0.95, hspace=0.2)
 	fig.set_size_inches(12, 16)
