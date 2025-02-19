@@ -1,11 +1,20 @@
 import csv
+import copy
 import numpy as np
 import glob
+import io
+import mido
 import os
+import re
+import requests
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import zipfile
+from bs4 import BeautifulSoup
 from tqdm import tqdm
+from urllib.parse import urljoin, urlparse
+
 
 # Neural network models
 class RNN(nn.Module):
@@ -78,99 +87,6 @@ class FeedForwardNN(nn.Module):
 		return x, x 
 
 
-# Data Loading
-class Chunker():
-
-	def __init__(self, songs_path, batch_size, chunk_size, chromatic, noise, dev=None):
-		
-		if dev is None:
-			dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-		self.songs_path = songs_path
-		self.batch_size = batch_size
-		self.chunk_size = chunk_size
-		self.chromatic  = chromatic
-		self.noise      = noise
-		self.dev        = dev
-
-		self.songs_dict = self._get_songs_()
-		self.song_pool  = list(self.songs_dict.keys())
-		self.song_list = [np.random.choice(self.song_pool) for _ in range(batch_size)]
-		self.t0  = [0 for _ in range(batch_size)]
-
-	def generate_chunk(self):
-		n_dims = self.songs_dict[self.song_pool[0]]['target'].shape[1]
-		target = np.zeros((self.batch_size, self.chunk_size, n_dims))
-		sample = np.zeros((self.batch_size, self.chunk_size, n_dims))
-
-		for n in range(self.batch_size):
-			t0, t1 = self.t0[n], self.t0[n] + self.chunk_size
-			target[n, :, :] = self.songs_dict[self.song_list[n]]['target'][t0:t1]
-			sample[n, :, :] = self.songs_dict[self.song_list[n]]['sample'][t0:t1]
-			if t1 > self.songs_dict[self.song_list[n]]['target'].shape[1]-self.chunk_size:
-				self.song_list[n] = np.random.choice(self.song_pool)
-				self.t0[n] = 0
-			else:
-				self.t0[n] += self.chunk_size
-
-		target = torch.tensor(target).to(device=self.dev).float()
-		sample = torch.tensor(sample).to(device=self.dev).float()
-
-		return target, sample
-
-	def _get_songs_(self):
-		
-		n_pad_song_end = 20
-
-		files = dict()
-		for filepath in glob.glob(os.path.join(self.songs_path, '*.csv')):
-			file = os.path.split(filepath)[-1]
-			if '_' in file:
-				opera = file.split('_')[0]
-			else:
-				opera = file.replace('.csv', '')
-			files[opera] = glob.glob(os.path.join(self.songs_path, f'{opera}*.csv'))
-
-		songs_dict = dict()
-		for opera in files:
-			songs_dict[opera] = dict()
-			targets = []
-			for file in files[opera]:
-				with open(file, 'r') as f:
-					targets += [el for el in list(csv.reader(f)) if el != []]
-					targets += [[]] * n_pad_song_end
-
-			target_array = self._generate_target_array_(targets)
-			sample_array = self._add_noise_to_target_(target_array)
-			songs_dict[opera]['target'] = target_array
-			songs_dict[opera]['sample'] = sample_array
-
-		return songs_dict
-
-	def _generate_target_array_(self, targets):
-
-		if self.chromatic:
-			n_midi_notes = 12
-		else:
-			n_midi_notes   = 108
-		
-		song_len = int(self.chunk_size * np.ceil(len(targets)/self.chunk_size))
-		target_array = np.zeros((song_len, n_midi_notes))
-
-		for tick, target_chord in enumerate(targets):
-			for target_note in [int(note)-1 for note in target_chord if note != '']:
-				note = target_note % 12 if self.chromatic else target_note
-				target_array[tick, note] = 1
-
-		return target_array
-
-	def _add_noise_to_target_(self, target_array):
-
-		sample_array = target_array + self.noise * np.random.randn(*target_array.shape)
-
-		return(sample_array)
-
-
 # Model object
 class Bachmodel():
 
@@ -184,8 +100,8 @@ class Bachmodel():
 		self.dev  = dev
 		self.chromatic       = pars['chromatic']
 		self.noise           = pars['noise']
-		self.train_path      = os.path.join(pars['datapath'], 'train')
-		self.validation_path = os.path.join(pars['datapath'], 'test')
+		self.train_path      = os.path.join(pars['datapath'], 'training')
+		self.validation_path = os.path.join(pars['datapath'], 'validation')
 		self.test_path       = os.path.join(pars['datapath'], 'test')
 
 		n_dim = 12 if self.chromatic else 108
@@ -317,6 +233,304 @@ class Bachmodel():
 		filepath = os.path.join(folder, name + suffix + extension)
 
 		return filepath
+
+
+# Data Loading
+class Chunker():
+
+	def __init__(self, songs_path, batch_size, chunk_size, chromatic, noise, dev=None):
+		
+		if dev is None:
+			dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+		self.songs_path = songs_path
+		self.batch_size = batch_size
+		self.chunk_size = chunk_size
+		self.chromatic  = chromatic
+		self.noise      = noise
+		self.dev        = dev
+
+		self.songs_dict = self._get_songs_()
+		self.song_pool  = list(self.songs_dict.keys())
+		self.song_list = [np.random.choice(self.song_pool) for _ in range(batch_size)]
+		self.t0  = [0 for _ in range(batch_size)]
+
+	def generate_chunk(self):
+		n_dims = self.songs_dict[self.song_pool[0]]['target'].shape[1]
+		target = np.zeros((self.batch_size, self.chunk_size, n_dims))
+		sample = np.zeros((self.batch_size, self.chunk_size, n_dims))
+
+		for n in range(self.batch_size):
+			t0, t1 = self.t0[n], self.t0[n] + self.chunk_size
+			target[n, :, :] = self.songs_dict[self.song_list[n]]['target'][t0:t1]
+			sample[n, :, :] = self.songs_dict[self.song_list[n]]['sample'][t0:t1]
+			if t1 > self.songs_dict[self.song_list[n]]['target'].shape[1]-self.chunk_size:
+				self.song_list[n] = np.random.choice(self.song_pool)
+				self.t0[n] = 0
+			else:
+				self.t0[n] += self.chunk_size
+
+		target = torch.tensor(target).to(device=self.dev).float()
+		sample = torch.tensor(sample).to(device=self.dev).float()
+
+		return target, sample
+
+	def _get_songs_(self):
+		
+		n_pad_song_end = 20
+
+		files = dict()
+		for filepath in glob.glob(os.path.join(self.songs_path, '*.csv')):
+			file = os.path.split(filepath)[-1]
+			if '_' in file:
+				opera = file.split('_')[0]
+			else:
+				opera = file.replace('.csv', '')
+			files[opera] = glob.glob(os.path.join(self.songs_path, f'{opera}*.csv'))
+
+		songs_dict = dict()
+		for opera in files:
+			songs_dict[opera] = dict()
+			targets = []
+			for file in files[opera]:
+				with open(file, 'r') as f:
+					targets += [el for el in list(csv.reader(f)) if el != []]
+					targets += [[]] * n_pad_song_end
+
+			target_array = self._generate_target_array_(targets)
+			sample_array = self._add_noise_to_target_(target_array)
+			songs_dict[opera]['target'] = target_array
+			songs_dict[opera]['sample'] = sample_array
+
+		return songs_dict
+
+	def _generate_target_array_(self, targets):
+
+		if self.chromatic:
+			n_midi_notes = 12
+		else:
+			n_midi_notes   = 108
+		
+		song_len = int(self.chunk_size * np.ceil(len(targets)/self.chunk_size))
+		target_array = np.zeros((song_len, n_midi_notes))
+
+		for tick, target_chord in enumerate(targets):
+			for target_note in [int(note)-1 for note in target_chord if note != '']:
+				note = target_note % 12 if self.chromatic else target_note
+				target_array[tick, note] = 1
+
+		return target_array
+
+	def _add_noise_to_target_(self, target_array):
+
+		sample_array = target_array + self.noise * np.random.randn(*target_array.shape)
+
+		return(sample_array)
+
+
+# Data Retriever
+class BWVRetriever():
+
+	def __init__(self, save_dir, opera_list_file=None, verbose=False):
+
+		os.makedirs(save_dir, exist_ok=True)
+
+		if opera_list_file is None: 
+			opera_list_file = os.path.join(save_dir, '_list.txt') 
+			open(opera_list_file, 'w').close()
+		
+		self.save_dir        = save_dir
+		self.opera_list_file = opera_list_file
+		self.downloaded      = self.read_opera_list()
+		self.verbose         = verbose
+
+
+
+	def scrape_websites(self, base_urls=[]):
+
+		if type(base_urls) is not list:
+			base_urls = [base_urls]
+
+		for base_url in base_urls:
+			self._scrape_page_(base_url)
+
+		self._write_opera_list_()
+
+
+	def _scrape_page_(self, base_url, url=None, visited=None):
+
+		if url     is None: url     = copy.copy(base_url)
+		if visited is None: visited = set()
+		
+		if url in visited:
+			return None
+
+		visited.add(url)
+
+		print(f'Scraping: {url}')
+		response = requests.get(url)
+		
+		if response.status_code != 200:
+			print(f'Failed to fetch {url}')
+			return
+
+		soup = BeautifulSoup(response.text, 'html.parser')
+
+		for link in soup.find_all('a', href=True):
+			full_url = urljoin(url, link['href'])
+
+			# Ignore external links
+			if base_url not in full_url:
+				continue
+			
+			if full_url.lower().endswith(('.mid', '.midi', '.zip')): 
+				opera, fname = self._match_bwv_(link.text)
+				if opera is not None and opera not in self.downloaded:
+					success = self._save_file_(full_url, fname) 
+					if success: self.downloaded.append(opera)
+
+			elif full_url.lower().endswith(('.html')): # Recursively scrape new pages
+				self._scrape_page_(base_url, full_url, visited) 
+
+
+	def _match_bwv_(self, link_text):
+
+		# We are more lenient with MIDI files as they are guaranteed to be Bach's
+		regex_midi   = r'^(?:[a-zA-Z_-]*)(\d{3,4}|(?<=bwv)\d{1,4})'
+		regex_midi  += r'(?:[_\s-]*)?([^v\d][^v]*?)?(?:v\d+)?\.midi?$'
+		rematch_midi = re.search(regex_midi, link_text.lower())
+
+		# Zip files are forced to have a bwv in the name
+		regex_zip    = r'^(?:.*bwv.*?)(\d{1,4}).*?\.zip$'
+		rematch_zip  = re.search(regex_zip, link_text.lower())
+
+		if rematch_midi:
+			opera  = f'bwv{int(rematch_midi.group(1)):04d}'
+			suffix = rematch_midi.group(2)
+			
+			if suffix is None: suffix = ''
+			else: suffix = f"_{re.sub(r'[^a-zA-Z0-9]', '', suffix)}"
+		
+			fname = opera + suffix + '.mid'
+		
+		elif rematch_zip:
+			opera = f'bwv{int(rematch_zip.group(1)):04d}'
+			fname = opera + '.zip'
+
+		else:
+			opera, fname = None, None
+
+		if self.verbose: print(f'{link_text} → {fname}')
+		
+		return opera, fname
+
+
+	def _save_file_(self, file_url, fname):
+			
+		if self.verbose: print(f'saving: {file_url}')
+		response = requests.get(file_url, stream=True)
+		
+		if response.status_code == 200:
+
+			if 'mid' in os.path.splitext(fname)[1]:
+				
+				tmp_filepath = os.path.join(self.save_dir, 'tmp.mid')
+				with open(tmp_filepath, 'wb') as f:
+					for chunk in response.iter_content(chunk_size=1024):
+						f.write(chunk)
+				
+				targets = self._read_targets_from_midi_(tmp_filepath)
+				os.remove(tmp_filepath)
+
+				file_name = os.path.join(self.save_dir, os.path.splitext(fname)[0]+'.csv')
+				with open(file_name, 'w') as f:
+					csv.writer(f).writerows(targets)
+
+
+			elif os.path.splitext(fname)[1] == 'zip':
+				pass 
+
+				# ToDo: If zip files with .mid files exist and the files contain 
+				# works that are not listed in the global bwv list, unzip the file
+				# and save the relevant midis
+				"""
+			    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+			        for zip_info in zip_ref.infolist():
+			            if zip_info.filename.lower().endswith(('.mid', '.midi')):  # Check for MIDI files
+			                # Rename file: remove .zip from fname and append MIDI file name
+			                zip_base = os.path.splitext(fname)[0]  # Remove .zip extension
+			                new_fname = f"{zip_base}_{os.path.basename(zip_info.filename)}"
+			                extract_path = os.path.join(save_dir, new_fname)
+
+			                # Extract and save file directly
+			                with zip_ref.open(zip_info.filename) as source, open(extract_path, 'wb') as target:
+			                    target.write(source.read())
+			    """
+
+		else:
+			if self.verbose: print(f'Failed to save: {file_url}')
+
+		return response.status_code == 200
+
+
+	def _read_targets_from_midi_(self, midi_file):
+
+		# 1) extract notes from midi using mido
+		mid = mido.MidiFile(midi_file, clip=True)
+
+		notes = []
+		pending = {}
+		for track in mid.tracks: 
+			abstime = 0 # reset absolute time at the start of each track.
+			for el in track:
+				abstime += el.time
+				if (el.type=='note_on' and el.velocity>0):
+					pending[el.note] = {'note': el.note, 't0': abstime}
+				if (el.type=='note_off' or (el.type=='note_on' and el.velocity==0)):
+					if el.note in pending:
+						this_note = pending[el.note]
+						this_note['t1'] = abstime
+						notes.append(this_note)
+						del pending[el.note]
+
+		# 2) parcelate streams into single-chord boxes 
+		mbox = np.nan * np.ones((1, max([note['t1'] for note in notes])))
+		for ix, note in enumerate(notes):
+			t0, t1, n = note['t0'], note['t1'], 0
+			while not np.isnan(mbox[n, t0:t1]).all():
+				n += 1
+				if n >= mbox.shape[0]:
+					mbox = np.pad(mbox, ((0,1),(0,0)), constant_values=np.nan)
+			mbox[n, t0:t1] = note['note']
+
+		# 3) locate the targets within teach tick of the music box
+		target_list = [[int(note) for note in mbox[:, 0] if not np.isnan(note)]]
+		for tick in range(1, mbox.shape[1]):
+			this_target = [int(note) for note in mbox[:, tick] if not np.isnan(note)]
+			if this_target != target_list[-1] and not this_target == []:
+				target_list.append(this_target)
+
+		return target_list
+
+
+	def read_opera_list(self):
+
+		with open(self.opera_list_file, 'r') as f:
+			opera_list = f.read().split('\n')
+
+		opera_list = [opera for opera in opera_list if opera != '']
+
+		return sorted(opera_list)
+
+
+	def _write_opera_list_(self):
+
+		opera_list = [opera for opera in self.downloaded if opera != '']
+
+		with open(self.opera_list_file, 'w') as f:
+			f.write('\n'.join(sorted(opera_list)))
+
+
 
 
 def test_globaldist_model(pars, n_train_samples, n_test_samples, dev=None):

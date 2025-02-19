@@ -1,10 +1,39 @@
 import bachbayes
+import glob
 import matplotlib.pyplot as plt
 import numpy as np
-import pickle
 import os
+import pickle
+import random
 import seaborn as sns
+import shutil
 import time
+
+
+def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
+
+	base_urls = ['http://www.jsbach.net/midi/']
+	save_dir  = 'data'
+
+	retriever = bachbayes.BWVRetriever(save_dir, verbose=True)
+	#retriever.scrape_websites(base_urls)
+
+	operas = [os.path.split(fpath)[1] for fpath in glob.glob(save_dir + '/bwv*.csv')]
+
+	n_test_samples  = int(np.round(len(operas) * test_rat))
+	n_val_samples   = int(np.round(len(operas) * validation_rat))
+
+	random.shuffle(operas)
+
+	samples = {'test': operas[:n_test_samples],
+			   'validation': operas[n_test_samples:(n_val_samples+n_test_samples)],
+			   'training': operas[(n_val_samples+n_test_samples):]}
+
+	for key in samples:
+		sample_dir = os.path.join(basedir, key)
+		os.makedirs(sample_dir, exist_ok=True)
+		for opera in samples[key]:
+			shutil.copy(os.path.join(save_dir, opera), os.path.join(sample_dir, opera))
 
 
 def main_fitting(noise, n_hidden):
@@ -263,8 +292,10 @@ def plot_errors():
 	fig.savefig('errors.png')
 
 
-pipeline()
-plot_errors()
+
+# prepare_data()
+# pipeline()
+# plot_errors()
 
 
 
