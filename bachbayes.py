@@ -13,7 +13,7 @@ import torch.optim as optim
 import zipfile
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 
 # Neural network models
@@ -345,7 +345,6 @@ class BWVRetriever():
 		self.verbose         = verbose
 
 
-
 	def scrape_websites(self, base_urls=[]):
 
 		if type(base_urls) is not list:
@@ -356,6 +355,34 @@ class BWVRetriever():
 
 		self._write_opera_list_()
 
+
+	def delete_duplicates(self):
+
+		files_by_prefix = {}
+
+		for filename in os.listdir(self.save_dir):
+		    if filename.endswith('.csv') and '_' in filename:
+		        prefix = filename.split('_')[0]
+		        files_by_prefix.setdefault(prefix, []).append(filename)
+
+		for prefix, files in files_by_prefix.items():
+		    lengths = {}
+		    for f in files:
+		        file_path = os.path.join(self.save_dir, f)
+		        try:
+		            with open(file_path, 'r') as file:
+		                length = sum(1 for line in file) - 1
+
+		        except Exception as e:
+		            print(f"Error reading {f}: {e}")
+		            continue
+
+		        if length in lengths:
+		            os.remove(file_path)
+		            print(f"Deleted duplicate: {f} (same length as {lengths[length]})")
+		        else:
+		            lengths[length] = f
+		
 
 	def _scrape_page_(self, base_url, url=None, visited=None):
 
@@ -376,21 +403,120 @@ class BWVRetriever():
 
 		soup = BeautifulSoup(response.text, 'html.parser')
 
+		# Build filename → BWV mapping from the table (only if suzumidi)
+		filename_to_bwv = {}
+		current_bwv_range = None
+
+		is_suzumidi = 'suzumidi' in url.lower()
+
+		if is_suzumidi:
+			for row in soup.find_all('tr'):
+				cells = row.find_all('td')
+				if len(cells) >= 2:
+					title_text = cells[0].get_text(strip=True)
+
+					# Check for BWV range
+					range_match = re.search(r'BWV\s?(\d{3,4})-(\d{3,4})', title_text, re.IGNORECASE)
+					if range_match:
+						start_num = int(range_match.group(1))
+						end_num = int(range_match.group(2))
+						current_bwv_range = (start_num, end_num)
+					else:
+						current_bwv_range = None
+
+					file_link = cells[1].find('a', href=True)
+					if file_link:
+						filename = file_link['href'].split('/')[-1]
+
+						if current_bwv_range:
+							# Take BWV number from filename
+							bwv_num_match = re.search(r'(\d{3,4})', filename.lower())
+							if bwv_num_match:
+								num = int(bwv_num_match.group(1))
+								if current_bwv_range[0] <= num <= current_bwv_range[1]:
+									bwv_num = f"bwv{num:04d}"
+									filename_to_bwv[filename.lower()] = bwv_num
+									continue
+
+						# Single BWV from table title
+						bwv_match = re.search(r'BWV\s?(\d{3,4})', title_text, re.IGNORECASE)
+						if bwv_match:
+							bwv_num = f"bwv{int(bwv_match.group(1)):04d}"
+							filename_to_bwv[filename.lower()] = bwv_num
+
+		# Main loop over links
+		base_domain = urlparse(base_url).netloc
+		allowed_paths = ['/midi/', '/music/', '/works/', '/midi-list/', '/bach-ken/',
+						'/bwv-list/', '/musique/', '/prs/']
+
 		for link in soup.find_all('a', href=True):
 			full_url = urljoin(url, link['href'])
+			parsed = urlparse(full_url)
 
-			# Ignore external links
-			if base_url not in full_url:
+			url_path = parsed.path.lower()
+			url_query = parsed.query
+			full_domain = parsed.netloc
+
+			if full_domain != base_domain:
 				continue
-			
-			if full_url.lower().endswith(('.mid', '.midi', '.zip')): 
-				opera, fname = self._match_bwv_(link.text)
-				if opera is not None and opera not in self.downloaded:
-					success = self._save_file_(full_url, fname) 
-					if success: self.downloaded.append(opera)
 
-			elif full_url.lower().endswith(('.html')): # Recursively scrape new pages
-				self._scrape_page_(base_url, full_url, visited) 
+			downloaded_this_round = False
+
+			# Case 1: Direct file
+			if url_path.endswith(('.mid', '.midi', '.zip')):
+				filename = url_path.split('/')[-1]
+
+				opera = filename_to_bwv.get(filename.lower()) if is_suzumidi else None
+
+				if opera is None:
+					opera, fname = self._match_bwv_(filename)
+				else:
+					# For suzumidi: special single BWV case
+					if filename.lower().endswith(('.mid', '.midi')):
+						suffix_match = re.search(r'(\d{3,4})([^a-zA-Z0-9]?)(.*)\.mid', filename.lower())
+						if suffix_match and current_bwv_range is None:
+							suffix = re.sub(r'[^a-zA-Z0-9]', '', suffix_match.group(3))
+							fname = opera + (f'_{suffix}' if suffix else '') + '.mid'
+						else:
+							fname = opera + '.mid'
+					elif filename.lower().endswith('.zip'):
+						fname = opera + '.zip'
+					else:
+						fname = filename
+
+				if opera and opera not in self.downloaded:
+					if self._save_file_(full_url, fname, opera=opera, suzumidi=is_suzumidi):
+						self.downloaded.append(opera)
+						downloaded_this_round = True
+
+			# Case 2: Query string
+			if not downloaded_this_round and url_query:
+				qs = parse_qs(url_query)
+				if 'file' in qs:
+					for f in qs['file']:
+						if f.lower().endswith(('.mid', '.midi', '.zip')):
+							filename = f.split('/')[-1]
+							opera = filename_to_bwv.get(filename.lower()) if is_suzumidi else None
+
+							if opera is None:
+								opera, fname = self._match_bwv_(filename)
+							else:
+								if filename.lower().endswith(('.mid', '.midi')):
+									fname = opera + '.mid'
+								elif filename.lower().endswith('.zip'):
+									fname = opera + '.zip'
+								else:
+									fname = filename
+
+							if opera and opera not in self.downloaded:
+								if self._save_file_(full_url, fname, opera=opera, suzumidi=is_suzumidi):
+									self.downloaded.append(opera)
+									downloaded_this_round = True
+
+			# Recursively scrape
+			if (url_path.endswith(('.html', '.php')) or url_query) and 'bach' in full_url.lower():
+				if any(path in url_path for path in allowed_paths):
+					self._scrape_page_(base_url, full_url, visited)
 
 
 	def _match_bwv_(self, link_text):
@@ -425,50 +551,105 @@ class BWVRetriever():
 		return opera, fname
 
 
-	def _save_file_(self, file_url, fname):
-			
-		if self.verbose: print(f'saving: {file_url}')
-		response = requests.get(file_url, stream=True)
+	def _save_file_(self, file_url, fname, opera=None, suzumidi=False, filename_to_bwv=None):
+	
+		if self.verbose:
+			print(f'saving: {file_url}')
 		
+		response = requests.get(file_url, stream=True)
+
 		if response.status_code == 200:
 
-			if 'mid' in os.path.splitext(fname)[1]:
+			if os.path.splitext(fname)[1] in ('.mid', '.midi'):
 				
 				tmp_filepath = os.path.join(self.save_dir, 'tmp.mid')
 				with open(tmp_filepath, 'wb') as f:
 					for chunk in response.iter_content(chunk_size=1024):
 						f.write(chunk)
-				
-				targets = self._read_targets_from_midi_(tmp_filepath)
+
+				try:
+					targets = self._read_targets_from_midi_(tmp_filepath)
+				except OSError as e:
+					if self.verbose:
+						print(f"Failed to parse MIDI file {fname} from {file_url}: {e}")
+					os.remove(tmp_filepath)
+					return False
+
 				os.remove(tmp_filepath)
 
-				file_name = os.path.join(self.save_dir, os.path.splitext(fname)[0]+'.csv')
+				if targets is None:
+					if self.verbose:
+						print(f"Skipping file {file_url} due to failed MIDI parsing.")
+					return False
+
+				file_name = os.path.join(self.save_dir, os.path.splitext(fname)[0] + '.csv')
 				with open(file_name, 'w') as f:
 					csv.writer(f).writerows(targets)
 
+			elif os.path.splitext(fname)[1] == '.zip' and suzumidi:
+				
+				with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+					midi_count = 0
 
-			elif os.path.splitext(fname)[1] == 'zip':
-				pass 
+					for zip_info in zip_ref.infolist():
+						if zip_info.filename.lower().endswith(('.mid', '.midi')):
+							midi_count += 1
+							midi_filename = os.path.basename(zip_info.filename).lower()
 
-				# ToDo: If zip files with .mid files exist and the files contain 
-				# works that are not listed in the global bwv list, unzip the file
-				# and save the relevant midis
-				"""
-			    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
-			        for zip_info in zip_ref.infolist():
-			            if zip_info.filename.lower().endswith(('.mid', '.midi')):  # Check for MIDI files
-			                # Rename file: remove .zip from fname and append MIDI file name
-			                zip_base = os.path.splitext(fname)[0]  # Remove .zip extension
-			                new_fname = f"{zip_base}_{os.path.basename(zip_info.filename)}"
-			                extract_path = os.path.join(save_dir, new_fname)
+							# Extract 3-4 digit number from the filename inside ZIP
+							number_match = re.search(r'(\d{3,4})', midi_filename)
+							if number_match:
+								num = int(number_match.group(1))
+								new_fname_base = f'bwv{num:04d}'
+							else:
+								# fallback name
+								zip_base = opera if opera else os.path.splitext(fname)[0]
+								suffix_match = re.search(r'([a-zA-Z0-9]+)\.mid$', midi_filename)
+								suffix = suffix_match.group(1) if suffix_match else f"{midi_count}"
+								new_fname_base = f"{zip_base}_{suffix}"
 
-			                # Extract and save file directly
-			                with zip_ref.open(zip_info.filename) as source, open(extract_path, 'wb') as target:
-			                    target.write(source.read())
-			    """
+							with zip_ref.open(zip_info.filename) as source:
+								
+								midi_bytes = source.read()
+								tmp_filepath = os.path.join(self.save_dir, 'tmp.mid')
+								
+								with open(tmp_filepath, 'wb') as f:
+									f.write(midi_bytes)
+
+								try:
+									targets = self._read_targets_from_midi_(tmp_filepath)
+								except OSError as e:
+									if self.verbose:
+										print(f"Skipping file inside ZIP due to failed MIDI parsing: {midi_filename}: {e}")
+									os.remove(tmp_filepath)
+									continue
+
+								os.remove(tmp_filepath)
+
+								if targets is None:
+									if self.verbose:
+										print(f"Skipping file inside ZIP due to failed MIDI parsing: {midi_filename}")
+									continue
+
+								file_name = os.path.join(self.save_dir, new_fname_base + '.csv')
+								with open(file_name, 'w') as f:
+									csv.writer(f).writerows(targets)
+
+								if self.verbose:
+									print(f"Extracted and saved: {file_name}")
+
+			else:
+				# fallback for other file types
+				if os.path.splitext(fname)[1].lower() == '.zip' and not suzumidi:
+					if self.verbose:
+						print(f"Skipping saving ZIP file {fname} because suzumidi=False")
+				else:
+					with open(os.path.join(self.save_dir, fname), 'wb') as f:
+						f.write(response.content)
 
 		else:
-			if self.verbose: print(f'Failed to save: {file_url}')
+			if self.verbose:
+				print(f'Failed to save: {file_url}')
 
 		return response.status_code == 200
 
@@ -476,7 +657,11 @@ class BWVRetriever():
 	def _read_targets_from_midi_(self, midi_file):
 
 		# 1) extract notes from midi using mido
-		mid = mido.MidiFile(midi_file, clip=True)
+		try:
+			mid =  mido.MidiFile(midi_file, clip=True)
+		except mido.midifiles.meta.KeySignatureError as e:
+			print(f"Skipping file due to KeySignatureError: {midi_file} ({e})")
+			return None
 
 		notes = []
 		pending = {}

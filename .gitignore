@@ -1,7 +1,0 @@
-data/
-training/
-test/
-validation/
-models/
-__pycache__/
-*.png

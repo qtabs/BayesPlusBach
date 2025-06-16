@@ -12,11 +12,23 @@ import time
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 
-	base_urls = ['http://www.jsbach.net/midi/']
+	base_urls = ["http://www.jsbach.net/midi/", 
+				 "https://www.metronimo.com/fr/midi/index.php?page=Bach", 
+				 "http://piano-midi.de/bach.htm",
+				 "https://sound.jp/bach-ken/en/midi-list.html",
+				 "http://www.dardel.info/musique/Bach.html",
+				 "https://www.classicalarchives.com/prs/free.html",
+				 "https://suzumidi.com/en/bach1.htm",
+				 "https://suzumidi.com/en/bach2.htm",
+				 "https://suzumidi.com/en/bach3.htm",
+				 "https://suzumidi.com/en/bach4.htm",
+				 "https://suzumidi.com/en/bach5.htm",
+				 "https://suzumidi.com/en/bach6.htm"]
 	save_dir  = 'data'
 
 	retriever = bachbayes.BWVRetriever(save_dir, verbose=True)
-	#retriever.scrape_websites(base_urls)
+	retriever.scrape_websites(base_urls)
+	retriever.delete_duplicates()
 
 	operas = [os.path.split(fpath)[1] for fpath in glob.glob(save_dir + '/bwv*.csv')]
 
@@ -289,12 +301,12 @@ def plot_errors():
 
 	fig.subplots_adjust(left=0.07, bottom=0.05, right=0.99, top=0.95, hspace=0.2)
 	fig.set_size_inches(12, 16)
-	fig.savefig('errors.png')
+	fig.savefig('errors.svg')
 
 
 
 # prepare_data()
-# pipeline()
+pipeline()
 # plot_errors()
 
 
