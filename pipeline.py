@@ -64,8 +64,8 @@ def main_fitting(noise, n_hidden):
 	lr = 0.02
 	chunk_size = 512
 	batch_size = 512
-	max_batches_obs = 1000
-	n_batches_pred  = 500
+	max_batches_obs = 20000
+	n_batches_pred  = 3000
 	n_test_samples  = 4
 
 	## Training RNN on observation accuracy
@@ -108,8 +108,8 @@ def benchmarking(noise, n_hidden):
 	lr = 0.02
 	chunk_size = 512
 	batch_size = 512
-	max_batches_rnn = 5000
-	max_batches_ff  = 5000
+	max_batches_rnn = 25000
+	max_batches_ff  = 25000
 	n_test_samples  = 4
 
 	base_pars = {'datapath'   : '.',
