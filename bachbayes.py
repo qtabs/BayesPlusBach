@@ -59,7 +59,7 @@ class RNN(nn.Module):
 		x_obs  = self.sig_obs(self.out_obs(x))
 		x_pred = self.sig_pred(self.out_pred(x))
 
-		return x_obs, x_pred
+		return x_obs, x_pred, x
 
 
 class FeedForwardNN(nn.Module):
@@ -83,8 +83,8 @@ class FeedForwardNN(nn.Module):
 
 	def forward(self, x):
 		x = self.feedforward(x) 
-		# x serves as either inferred value or prediction:
-		return x, x 
+		# x serves as either inferred value or prediction
+		return x, x, None
 
 
 # Model object
@@ -122,7 +122,8 @@ class Bachmodel():
 
 	def load_weights(self, suffix=''):
 		weightpath = self._compose_weightpath_(suffix)
-		self.net.load_state_dict(torch.load(weightpath))
+		w = torch.load(weightpath, map_location=self.dev, weights_only=True)
+		self.net.load_state_dict(w)
 
 	def save_weights(self, suffix=''):
 		weightpath = self._compose_weightpath_(suffix)
@@ -156,7 +157,7 @@ class Bachmodel():
 			optimizer.zero_grad()
 			target, sample = chunker.generate_chunk()
 
-			obs, pred = self.net(target if target_as_input else sample)
+			obs, pred, _ = self.net(target if target_as_input else sample)
 
 			loss = 0
 			if 'obs' in obj:
@@ -190,28 +191,75 @@ class Bachmodel():
 
 		self._write_report_(loss_hist, freeze, obj)
 
-	def test(self, chunk_size, batch_size, n_samples=1, obj=['obs'], test_path=None):
+	def test(self, obj=['obs'], test_path=None):
 
 		if test_path is None:
 			test_path = self.test_path
-		chunker = Chunker(test_path, batch_size, chunk_size, self.chromatic, self.noise, self.dev)
 
-		loss_func   = nn.BCELoss(reduction='none')
-		performance = np.zeros((n_samples, batch_size))
 
 		with torch.no_grad():
-			
-			for n_sample in (tqdm(range(n_samples)) if n_samples > 20  else range(n_samples)):	
-				target, sample = chunker.generate_chunk()
-				obs, pred = self.net(sample)
+	
+			chunker = Chunker(test_path, 1, None, self.chromatic, self.noise, self.dev)
+			operas  = sorted(chunker.song_pool)
 
-				loss = 0
+			performance = np.empty(len(operas))
+			loss_func   = nn.BCELoss(reduction='none')
+
+			for n, opera in enumerate(operas):
+				
+				target = chunker.read_song_as_tensor(opera)['target']
+				sample = chunker.read_song_as_tensor(opera)['sample']
+
+				obs, pred, _   = self.net(sample)
+
 				if 'obs' in obj:
-					loss += loss_func(obs, target).mean((1,2))
+					performance[n] = loss_func(obs, target).mean().cpu().numpy()
 				if 'pred' in obj:
-					loss += loss_func(pred[:, :-1], target[:, 1:]).mean((1,2))
+					performance[n] = loss_func(pred[:, :-1], target[:, 1:]).mean().cpu().numpy()
 
-				performance[n_sample, :] = loss.cpu().numpy()		
+		return performance
+
+	def compute_pe_and_state(self, sample):
+
+		with torch.no_grad():
+
+			obs, pred, hidden = self.net(sample)
+			pred   = pred.cpu().detach().numpy()
+			obs    = obs.cpu().detach().numpy()
+			hidden = hidden.cpu().detach().numpy()
+			sample = sample.cpu().detach().numpy()
+
+		pe  = sample[0, 1:] - pred[0, :-1]
+		stm = hidden[0, 1:]
+		std = hidden[0, 1:] - hidden[0, :-1]
+
+		return pe, stm, std
+
+	def test_globaldist_model(self):
+		
+		with torch.no_grad():
+			# Compute global distribution from training set
+			train_chunker = Chunker(self.train_path, 1, None, self.chromatic, self.noise, self.dev)
+			train_operas  = sorted(train_chunker.song_pool)
+
+			glob_dist = torch.zeros(self.net.n_dim).to(self.dev)
+			
+			for opera in train_operas:
+				glob_dist += train_chunker.read_song_as_tensor(opera)['sample'].mean((0, 1))
+			
+			glob_dist *= 1/glob_dist.sum()
+
+		# Measure performance in the testing set
+		with torch.no_grad():
+			test_chunker = Chunker(self.test_path, 1, None, self.chromatic, self.noise, self.dev)
+			test_operas  = sorted(test_chunker.song_pool)
+
+			performance = np.empty(len(test_operas))
+			loss_func   = nn.BCELoss(reduction='none')
+			
+			for n, opera in enumerate(test_operas):
+				target = test_chunker.read_song_as_tensor(opera)['target']
+				performance[n] = loss_func(glob_dist.expand(target.shape), target).mean().cpu().numpy()
 
 		return performance
 
@@ -230,7 +278,7 @@ class Bachmodel():
 
 		folder, fname = os.path.split(self.modpath)
 		name, extension = '.'.join(fname.split('.')[:-1]), fname.split('.')[-1]
-		filepath = os.path.join(folder, name + suffix + extension)
+		filepath = os.path.join(folder, name + suffix + '.' + extension)
 
 		return filepath
 
@@ -242,6 +290,8 @@ class Chunker():
 		
 		if dev is None:
 			dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+		self.song_end_pad = 20
 
 		self.songs_path = songs_path
 		self.batch_size = batch_size
@@ -275,10 +325,24 @@ class Chunker():
 
 		return target, sample
 
+	def read_song_as_tensor(self, opera):
+	
+		song = self.songs_dict[opera]
+
+		real_len = song['target'].shape[0]
+		for n_notes in song['target'].sum(1)[::-1]:
+			if n_notes == 0:
+				real_len -= 1
+			else:
+				break
+
+		options = {'dtype': torch.float32, 'device': self.dev}
+		song_tensor = {k: torch.tensor(song[k][None,:real_len], **options) for k in song}
+
+		return song_tensor
+
 	def _get_songs_(self):
 		
-		n_pad_song_end = 20
-
 		files = dict()
 		for filepath in glob.glob(os.path.join(self.songs_path, '*.csv')):
 			file = os.path.split(filepath)[-1]
@@ -295,7 +359,7 @@ class Chunker():
 			for file in files[opera]:
 				with open(file, 'r') as f:
 					targets += [el for el in list(csv.reader(f)) if el != []]
-					targets += [[]] * n_pad_song_end
+					targets += [[]] * self.song_end_pad
 
 			target_array = self._generate_target_array_(targets)
 			sample_array = self._add_noise_to_target_(target_array)
@@ -306,16 +370,19 @@ class Chunker():
 
 	def _generate_target_array_(self, targets):
 
-		if self.chromatic:
-			n_midi_notes = 12
+		n_midi_notes = 12 if self.chromatic else 108
+			
+		if self.chunk_size is None:
+			song_len = len(targets)
 		else:
-			n_midi_notes   = 108
+			max_chunks = np.ceil(len(targets) / self.chunk_size)
+			song_len   = int(self.chunk_size * max_chunks)
 		
-		song_len = int(self.chunk_size * np.ceil(len(targets)/self.chunk_size))
 		target_array = np.zeros((song_len, n_midi_notes))
 
 		for tick, target_chord in enumerate(targets):
-			for target_note in [int(note)-1 for note in target_chord if note != '']:
+			notes = [int(note)-1 for note in target_chord if note != '']
+			for target_note in notes:
 				note = target_note % 12 if self.chromatic else target_note
 				target_array[tick, note] = 1
 
@@ -344,7 +411,6 @@ class BWVRetriever():
 		self.downloaded      = self.read_opera_list()
 		self.verbose         = verbose
 
-
 	def scrape_websites(self, base_urls=[]):
 
 		if type(base_urls) is not list:
@@ -354,7 +420,6 @@ class BWVRetriever():
 			self._scrape_page_(base_url)
 
 		self._write_opera_list_()
-
 
 	def delete_duplicates(self):
 
@@ -382,8 +447,7 @@ class BWVRetriever():
 		            print(f"Deleted duplicate: {f} (same length as {lengths[length]})")
 		        else:
 		            lengths[length] = f
-		
-
+	
 	def _scrape_page_(self, base_url, url=None, visited=None):
 
 		if url     is None: url     = copy.copy(base_url)
@@ -518,7 +582,6 @@ class BWVRetriever():
 				if any(path in url_path for path in allowed_paths):
 					self._scrape_page_(base_url, full_url, visited)
 
-
 	def _match_bwv_(self, link_text):
 
 		# We are more lenient with MIDI files as they are guaranteed to be Bach's
@@ -549,7 +612,6 @@ class BWVRetriever():
 		if self.verbose: print(f'{link_text} → {fname}')
 		
 		return opera, fname
-
 
 	def _save_file_(self, file_url, fname, opera=None, suzumidi=False, filename_to_bwv=None):
 	
@@ -653,7 +715,6 @@ class BWVRetriever():
 
 		return response.status_code == 200
 
-
 	def _read_targets_from_midi_(self, midi_file):
 
 		# 1) extract notes from midi using mido
@@ -697,7 +758,6 @@ class BWVRetriever():
 
 		return target_list
 
-
 	def read_opera_list(self):
 
 		with open(self.opera_list_file, 'r') as f:
@@ -706,7 +766,6 @@ class BWVRetriever():
 		opera_list = [opera for opera in opera_list if opera != '']
 
 		return sorted(opera_list)
-
 
 	def _write_opera_list_(self):
 
@@ -717,46 +776,7 @@ class BWVRetriever():
 
 
 
-
-def test_globaldist_model(pars, n_train_samples, n_test_samples, dev=None):
-
-	if dev is None:
-		dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-	if n_train_samples > 512:
-		n_batches  = int(n_train_samples/512)
-		batch_size = 512
-	else:
-		n_batches = 1
-		batch_size = n_train_samples
-
-	train_chunker = Chunker(os.path.join(pars['datapath'], 'train'),
-							batch_size,
-							pars['chunk_size'],
-							pars['chromatic'], 
-							pars['noise'],
-							dev)
-
-	test_chunker  = Chunker(os.path.join(pars['datapath'], 'test'), 
-							n_test_samples, 
-							pars['chunk_size'],
-							pars['chromatic'],
-							pars['noise'],
-							dev)
-
-	glob_dist = torch.zeros(12 if pars['chromatic'] else 108).to(dev)
-	for n in range(n_batches):
-		glob_dist += train_chunker.generate_chunk()[1].mean((0, 1))
-	glob_dist *= 1/glob_dist.sum()
-
-	targets     = test_chunker.generate_chunk()[0]
-	loss_func   = nn.BCELoss(reduction='none')
-	performance = loss_func(glob_dist.expand(targets.shape), targets)
-
-	return performance
-
-
-
+############
 
 
 

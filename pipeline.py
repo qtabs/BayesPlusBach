@@ -1,13 +1,13 @@
 import bachbayes
 import glob
-import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pickle
 import random
-import seaborn as sns
 import shutil
 import time
+import scipy.stats as ss
+from sklearn.linear_model import LinearRegression
 
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
@@ -48,7 +48,14 @@ def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 			shutil.copy(os.path.join(save_dir, opera), os.path.join(sample_dir, opera))
 
 
-def main_fitting(noise, n_hidden):
+def main_fitting(noise, n_hidden, only_testing=False):
+
+	# Parameters
+	lr = 0.02
+	chunk_size = 512
+	batch_size = 512
+	max_batches_obs = 20000
+	n_batches_pred  = 3000
 
 	pars = {'datapath'   : '.',
 			'chunk_size' : 512,
@@ -60,57 +67,55 @@ def main_fitting(noise, n_hidden):
 
 	m = bachbayes.Bachmodel(pars)
 
+
 	# Training
-	lr = 0.02
-	chunk_size = 512
-	batch_size = 512
-	max_batches_obs = 20000
-	n_batches_pred  = 3000
-	n_test_samples  = 4
+	if only_testing:
+		m.load_weights('_prediction')
 
-	## Training RNN on observation accuracy
-	print('Training on observations...', end='')
-	t0 = time.time()
-	m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'])
-	m.save_weights('_observation')
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+	else:
+		## Training RNN on observation accuracy
+		print('Training on observations...', end='')
+		t0 = time.time()
+		m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'])
+		m.save_weights('_observation')
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
-	## Training linear readout on prediction accuracy
-	print('Training on predictions...', end='')
-	t0 = time.time()
-	m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'])
-	m.save_weights('_prediction')
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		## Training linear readout on prediction accuracy
+		print('Training on predictions...', end='')
+		t0 = time.time()
+		m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'])
+		m.save_weights('_prediction')
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+
 
 	# Testing
-	obs_error  = m.test(chunk_size, batch_size, n_test_samples, obj=['obs'])
-	pred_error = m.test(chunk_size, batch_size, n_test_samples, obj=['pred'])
+	obs_error  = m.test(obj=['obs'])
+	pred_error = m.test(obj=['pred'])
 
-	obs_err_m,  obs_err_e  = obs_error.mean(),  obs_error.std()  #/ n_test_samples**.5
-	pred_err_m, pred_err_e = pred_error.mean(), pred_error.std() #/ n_test_samples**.5
+
+	# Reporting
+	obs_err_m,  obs_err_e  = obs_error.mean(),  obs_error.std()
+	pred_err_m, pred_err_e = pred_error.mean(), pred_error.std()
 
 	print('\n---------------------------------')
 	print(f'| Observation error = {obs_err_m:.2f}' + u'\u00B1' + f'{obs_err_e:.2f} |')
 	print(f'| Prediction error  = {pred_err_m:.2f}' + u'\u00B1' + f'{pred_err_e:.2f} |')
 	print('---------------------------------\n')
 
-	performance = {'obs_err_m':  obs_err_m,
-				   'obs_err_e':  obs_err_e,
-				   'pred_err_m': pred_err_m,
-				   'pred_err_e': pred_err_e}
+	performance = {'obs_err': obs_error, 'pred_err': pred_error}
+
 
 	return performance
 
 
-def benchmarking(noise, n_hidden):
+def baselines(noise, n_hidden, only_testing=False):
 
-	# Global parameters
+	# Parameters
 	lr = 0.02
 	chunk_size = 512
 	batch_size = 512
 	max_batches_rnn = 25000
 	max_batches_ff  = 25000
-	n_test_samples  = 4
 
 	base_pars = {'datapath'   : '.',
 				 'chunk_size' : chunk_size,
@@ -118,90 +123,95 @@ def benchmarking(noise, n_hidden):
 				 'noise'      : noise,
 				 'n_hidden'   : n_hidden}
 
+
 	# Observations high-bound -> NN one-step
-	print('Benchmarking (observations high bound)...', end='')
-	t0 = time.time()
 	pars = {'mod_type': 'feedforward', 'n_layers': 3}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	if not m.trained_weights_exists('_observation-high'):
-		m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['obs'])
-		m.save_weights('_observation-high')
-	obs_high = m.test(chunk_size, batch_size, n_test_samples, obj=['obs'])
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+
+	if only_testing:
+		m.load_weights('_observation-high')
+	else:
+		print('Benchmarking (observations high bound)...', end='')
+		t0 = time.time()
+		if not m.trained_weights_exists('_observation-high'):
+			m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['obs'])
+			m.save_weights('_observation-high')
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+	
+	obs_high = m.test(obj=['obs'])
+
 
 	# Predictions high-bound: global distribution
 	print('Benchmarking (predictions high bound)...', end='')
 	t0 = time.time()
-	n_train = max(max_batches_rnn, max_batches_ff) * batch_size
-	n_test  = n_test_samples * batch_size
-	pred_high = bachbayes.test_globaldist_model(base_pars, n_train, n_test)
+	pred_high = m.test_globaldist_model()
 	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+
 
 	# Predictions markov high bound: 1-back predictions
-	print('Benchmarking (predictions markov bound)...', end='')
-	t0 = time.time()
-	pars = {'mod_type': 'feedforward', 'n_layers': 3}
+	pars = {'mod_type': 'feedforward', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	if not m.trained_weights_exists('_prediction-markov-high'):
+	
+	if only_testing:
+		m.load_weights('_prediction-markov-high')
+	else:
+		print('Benchmarking (predictions markov bound)...', end='')
+		t0 = time.time()
 		m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['pred'])
 		m.save_weights('_prediction-markov-high')
-	pred_markh = m.test(chunk_size, batch_size, n_test_samples, obj=['pred'])
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+			
+	pred_markh = m.test(obj=['pred'])
+
 
 	# Predictions markov low bound: 1-back predictions with ground-truth state
-	print('Benchmarking (predictions markov low bound)...', end='')
-	t0 = time.time()
-	pars = {'mod_type': 'feedforward', 'n_layers': 3}
+	pars = {'mod_type': 'feedforward', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	if not m.trained_weights_exists('_prediction-markov-low'):
+
+	if only_testing:
+		m.load_weights('_prediction-markov-low')
+	else:
+		print('Benchmarking (predictions markov low bound)...', end='')
+		t0 = time.time()
 		m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['pred'], target_as_input=True)
 		m.save_weights('_prediction-markov-low')
-	pred_markl = m.test(chunk_size, batch_size, n_test_samples, obj=['pred'])
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		
+	pred_markl = m.test(obj=['pred'])
+
 
 	# Predictions low bound 
-	print('Benchmarking (predictions low bound)...', end='')
-	t0 = time.time()
 	pars = {'mod_type': 'gru', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	if not m.trained_weights_exists('_prediction-low'):
+	
+	if only_testing:
+		m.load_weights('_prediction-low')
+	else:
+		print('Benchmarking (predictions low bound)...', end='')
+		t0 = time.time()
 		m.train(lr, chunk_size, batch_size, max_batches_rnn, obj=['pred'])
 		m.save_weights('_prediction-low')
-	pred_low = m.test(chunk_size, batch_size, n_test_samples, obj=['pred'])
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
-
-	obs_high_m,  obs_high_e    = obs_high.mean(),   obs_high.std()
-	pred_high_m, pred_high_e   = pred_high.mean(),  pred_high.std()
-	pred_markh_m, pred_markh_e = pred_markh.mean(), pred_markh.std()
-	pred_markl_m, pred_markl_e = pred_markl.mean(), pred_markl.std()
-	pred_low_m,  pred_low_e    = pred_low.mean(),   pred_low.std()
-
-	print('\n----------------------------------------')
-	print(f'| Observation high-bound   = {obs_high_m:.2f}'   + u'\u00B1' + f'{obs_high_e:.2f} |')
-	print(f'| Predictions high-bound   = {pred_high_m:.2f}'  + u'\u00B1' + f'{pred_high_m:.2f} |')
-	print(f'| Predictions markov-bound = {pred_markl_m:.2f}' + u'\u00B1' + f'{pred_markl_e:.2f} |')
-	print(f'| Predictions low-bound    = {pred_low_m:.2f}'   + u'\u00B1' + f'{pred_low_e:.2f} |')
-	print('----------------------------------------\n')
-
-	benchmarks = {'obs_high_m':   obs_high_m,
-				  'obs_high_e':   obs_high_e,
-				  'pred_high_m':  pred_high_m,
-				  'pred_high_e':  pred_high_e,
-				  'pred_markh_m': pred_markh_m,
-				  'pred_markh_e': pred_markh_e,
-				  'pred_markl_m': pred_markl_m,
-				  'pred_markl_e': pred_markl_e,
-				  'pred_low_m':   pred_low_m,
-				  'pred_low_e':   pred_low_e}
-
-	return benchmarks
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+	
+	pred_low = m.test(obj=['pred'])
 
 
-def pipeline():
+	# Reporting
+	performance  = {'obs_high':   obs_high,
+			 		'pred_high':  pred_high,
+			 		'pred_markh': pred_markh,
+			 		'pred_markl': pred_markl,
+			 		'pred_low':   pred_low}
+
+
+	return performance
+
+
+def pipeline(only_testing=False):
 
 	noise_vals    = [0.001] + [round(0.1 * n, 2) for n in range(1, 21)]
 	n_hidden_vals = [2**n for n in range(1, 9)]
@@ -211,104 +221,166 @@ def pipeline():
 	for i, noise in enumerate(noise_vals):
 		for j, n_hidden in enumerate(n_hidden_vals):
 			
-			print(f'\nTraining model ({i:02},{j:02}) of ({len(noise_vals)},{len(n_hidden_vals)}))')
+			print(f'\nModel ({i:02},{j:02}) of ({len(noise_vals)},{len(n_hidden_vals)}))')
 			print('--------------------------------')
 			t0 = time.time()
 			
 			savedict = load_results()
 
-			if 'obs_m' not in savedict or np.isnan(savedict['obs_m'][i, j]):
-				performance = main_fitting(noise, n_hidden)
-				save_to_results(noise, n_hidden, **performance)
+			#if 'obs_err_m' not in savedict or np.isnan(savedict['obs_err_m'][i, j, 0]):
+			performance_rnn = main_fitting(noise, n_hidden, only_testing)
+			save_to_results(noise, n_hidden, **performance_rnn)
 
-			if 'pred_high_m' not in savedict or np.isnan(savedict['pred_high_m'][i, j]):
-				benchmarks = benchmarking(noise, n_hidden)
-				save_to_results(noise, n_hidden, **benchmarks)
+			#if 'pred_high_m' not in savedict or np.isnan(savedict['pred_high_m'][i, j, 0]):
+			performance_baseline = baselines(noise, n_hidden, only_testing)
+			save_to_results(noise, n_hidden, **performance_baseline)
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
 
 def save_to_results(this_noise=None, this_n_hidden=None, **kwargs):
 
-	if not os.path.exists('./models/results.pickle'):
+	if not os.path.exists('./results/results.pickle'):
 		savedict = {}
 	else:
-		with open('./models/results.pickle', 'rb') as f:
+		with open('./results/results.pickle', 'rb') as f:
 			savedict = pickle.load(f)
 
 	savedict.update({key: kwargs[key] for key in ['noise', 'n_hidden'] if key in kwargs})
 
 	noise, n_hidden = savedict['noise'], savedict['n_hidden']
 	for key in [k for k in kwargs if k not in savedict]: 
-		savedict[key] = np.nan * np.ones((len(noise), len(n_hidden)))
+		savedict[key] = np.nan * np.ones((len(noise), len(n_hidden), len(kwargs[key])))
 
 	if this_noise is not None and this_n_hidden is not None:
 		ix_noise, ix_n = noise.index(this_noise), n_hidden.index(this_n_hidden)
 		for key in [k for k in kwargs if k not in ['noise', 'n_hidden']]:
-			savedict[key][ix_noise, ix_n] = kwargs[key]
+			savedict[key][ix_noise, ix_n, :] = kwargs[key]
 
-	with open('./models/results.pickle', 'wb') as f:
+	with open('./results/results.pickle', 'wb') as f:
 		pickle.dump(savedict, f)
+
+
+def prediction_error_analysis_pipeline():
+
+	operas   = sorted(bachbayes.Chunker('./test', 1, None, True,0).song_pool)
+	savedict = load_results()
+	noise_vals    = savedict['noise']
+	n_hidden_vals = savedict['n_hidden']
+
+	results = {'pe_stm': np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
+			   'pe_std': np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
+			   #'en_m':   np.full((len(noise_vals), len(n_hidden_vals), len(operas), max(n_hidden_vals)), np.nan),
+			   #'en_d':   np.full((len(noise_vals), len(n_hidden_vals), len(operas), max(n_hidden_vals)), np.nan),
+			   'dec_m':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
+			   'dec_d':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
+			   'dec_b':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
+			   'noise': noise_vals, 'n_hidden': n_hidden_vals}
+
+	for six, noise in enumerate(noise_vals):
+		for nix, n_hidden in enumerate(n_hidden_vals):
+
+			t0 = time.time()
+			print(f'Computing PE for (noise={noise:.1f}, n={n_hidden})...', end='')
+
+
+			# A. Load model
+			pars = {'datapath'   : '.',
+					'chromatic'  : True,
+					'noise'      : noise,
+					'n_layers'   : 1,
+					'n_hidden'   : n_hidden,
+					'mod_type'   : 'gru'}
+
+			m = bachbayes.Bachmodel(pars)
+			m.load_weights('_prediction')
+
+
+			# B. Train stats to pe linear regression models
+			tr_chunker = bachbayes.Chunker(m.train_path, 1, None, m.chromatic, m.noise, m.dev)
+
+			pe_train, stm_train, std_train = [], [], [] 
+
+			for opera in tr_chunker.song_pool:
+
+				sample = tr_chunker.read_song_as_tensor(opera)['sample']
+				pe, stm, std = m.compute_pe_and_state(sample)
+
+				pe_train.append(pe)
+				stm_train.append(stm)
+				std_train.append(std)
+
+			pe_train  = np.concatenate(pe_train, axis=0)
+			stm_train = np.concatenate(stm_train, axis=0)
+			std_train = np.concatenate(std_train, axis=0)
+
+			reg_m = LinearRegression().fit(stm_train, pe_train)
+			reg_d = LinearRegression().fit(std_train, pe_train)
+
+
+			# C. Compute PE and stats in the test set 
+			chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev)
+			operas  = sorted(chunker.song_pool)
+
+			for nop, opera in enumerate(operas):
+
+				# 0. Computing prediction error and network's states
+				sample = chunker.read_song_as_tensor(opera)['sample']
+				pe, stm, std = m.compute_pe_and_state(sample)
+
+
+				# 1. Total prediction error with network activity
+				pe2  = (pe ** 2).mean(1)
+				stm2 = (stm ** 2).mean(1) 
+				std2 = (std ** 2).mean(1) 
+
+				results['pe_stm'][six, nix, nop] = ss.pearsonr(pe2, stm2)[0]
+				results['pe_std'][six, nix, nop] = ss.pearsonr(pe2, std2)[0]
+
+				"""
+				# 2. Prediction error encoding per neuron
+				for n in range(n_hidden):
+					stm2 = stm[..., n] ** 2
+					std2 = std[..., n] ** 2
+					results['en_m'][six, nix, nop, n] = ss.pearsonr(pe2, stm2)[0]
+					results['en_d'][six, nix, nop, n] = ss.pearsonr(pe2, std2)[0]
+				"""
+
+				# 3. Prediction error decoding accuracy
+				pe_hat_m = reg_m.predict(stm)
+				pe_hat_d = reg_d.predict(std)
+				pe_hat_b = pe_train.mean(0)
+
+				results['dec_m'][six, nix, nop] = ((pe - pe_hat_m)**2).mean()
+				results['dec_d'][six, nix, nop] = ((pe - pe_hat_d)**2).mean()
+				results['dec_b'][six, nix, nop] = ((pe - pe_hat_b)**2).mean()
+
+
+			with open('./results/pe_results.pickle', 'wb') as f:
+				pickle.dump(results, f)
+
+			print(f' done! Time = {(time.time()-t0)/60:.2f}m')
+
+
+	# ToDo: Enconding of PE+/- --> (np.maximum(-pe,  0)**2).mean(1)
 
 
 def load_results():
 
-	with open('./models/results.pickle', 'rb') as f:
+	with open('./results/results.pickle', 'rb') as f:
 		savedict = pickle.load(f)
 
 	return savedict
 
 
-def plot_errors():
-
-	savedict = load_results()
-
-	noise, n_hidden = savedict['noise'], savedict['n_hidden']
-	obs_m,        obs_e        = savedict['obs_err_m'],    savedict['obs_err_e'],
-	pred_m,       pred_e       = savedict['pred_err_m'],   savedict['pred_err_e']
-	obs_high_m,   obs_high_e   = savedict['obs_high_m'],   savedict['obs_high_e']
-	pred_high_m,  pred_high_e  = savedict['pred_high_m'],  savedict['pred_high_e']
-	pred_markl_m, pred_markl_e = savedict['pred_markl_m'], savedict['pred_markl_e']
-	pred_markh_m, pred_markh_e = savedict['pred_markh_m'], savedict['pred_markh_e']
-	pred_low_m,   pred_low_e   = savedict['pred_low_m'],   savedict['pred_low_e']
-
-	obs_n        = obs_m  - obs_high_m    / (.5*obs_e**2  + .5*obs_high_e**2  )**.5
-	pred_n       = pred_m - pred_high_m   / (.5*pred_e**2 + .5*pred_high_e**2 )**.5
-	markov_imp_n = pred_m - pred_markl_m  / (.5*pred_e**2 + .5*pred_markl_e**2)**.5
-
-	d = (pred_m - obs_m) / (.5*obs_e**2 + .5*pred_e**2)**.5
-	D = (pred_m - obs_m)
-
-	fig, axs = plt.subplots(3,1)
-
-	sns.heatmap(obs_n.T,  square=True, xticklabels=noise, yticklabels=n_hidden, 
-				annot=True, fmt='.2f', vmin=-10, vmax=0, ax=axs[0])
-	axs[0].set_ylabel('relative noise')
-	axs[0].set_ylabel('hidden units')
-	axs[0].set_title('d(observation error - high bound)')
-
-	sns.heatmap(pred_n.T, square=True, xticklabels=noise, yticklabels=n_hidden, 
-				annot=True, fmt='.2f', vmin=-0.5, vmax=0, ax=axs[1])
-	axs[1].set_ylabel('relative noise')
-	axs[1].set_ylabel('hidden units')
-	axs[1].set_title('d(prediction error - high bound)')
-
-	sns.heatmap(markov_imp_n.T, square=True, xticklabels=noise, yticklabels=n_hidden, 
-				annot=True, fmt='.2f', vmin=-10, vmax=0, ax=axs[2])
-	axs[2].set_ylabel('relative noise')
-	axs[2].set_ylabel('hidden units')
-	axs[2].set_title('d(prediction error - markovian low bound)')
-
-	fig.subplots_adjust(left=0.07, bottom=0.05, right=0.99, top=0.95, hspace=0.2)
-	fig.set_size_inches(12, 16)
-	fig.savefig('errors.svg')
+if __name__ == '__main__':
+	# prepare_data()
+	# pipeline()
+	# pipeline(only_testing=True)
+	prediction_error_analysis_pipeline()
 
 
-
-# prepare_data()
-pipeline()
-# plot_errors()
-
-
+# ToDo: 
+#  - rename baseline variables to more informative names (e.g. globaldist)
 
 
