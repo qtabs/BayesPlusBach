@@ -135,7 +135,7 @@ class Bachmodel():
 
 	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False):
 		
-		tolerance = 1 # loss < validation_loss + tol * std_validation_loss --> early stopping 
+		tolerance = 0.5 # loss < validation_loss + tol * std_validation_loss --> early stopping 
 		chunker = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
   
 		# Select which parameters to train
