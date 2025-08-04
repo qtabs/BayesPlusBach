@@ -48,7 +48,7 @@ def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 			shutil.copy(os.path.join(save_dir, opera), os.path.join(sample_dir, opera))
 
 
-def main_fitting(noise, n_hidden, only_testing=False):
+def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 
 	# Parameters
 	lr = 0.02
@@ -70,21 +70,21 @@ def main_fitting(noise, n_hidden, only_testing=False):
 
 	# Training
 	if only_testing:
-		m.load_weights('_prediction')
+		m.load_weights(f'_prediction_run{run_n:02d}')
 
 	else:
 		## Training RNN on observation accuracy
 		print('Training on observations...', end='')
 		t0 = time.time()
 		m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'])
-		m.save_weights('_observation')
+		m.save_weights(f'_observation_run{run_n:02d}')
 		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
 		## Training linear readout on prediction accuracy
 		print('Training on predictions...', end='')
 		t0 = time.time()
 		m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'])
-		m.save_weights('_prediction')
+		m.save_weights(f'_prediction_run{run_n:02d}')
 		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
 
@@ -200,6 +200,8 @@ def baselines(noise, n_hidden, only_testing=False):
 	pred_low = m.test(obj=['pred'])
 
 
+	# ToDo: Use linear regression instead of 1-layer ANNs for the Markov models
+
 	# Reporting
 	performance  = {'obs_high':   obs_high,
 			 		'pred_high':  pred_high,
@@ -215,8 +217,9 @@ def pipeline(only_testing=False):
 
 	noise_vals    = [0.001] + [round(0.1 * n, 2) for n in range(1, 21)]
 	n_hidden_vals = [2**n for n in range(1, 9)]
+	n_runs = 9
 
-	save_to_results(noise=noise_vals, n_hidden=n_hidden_vals)
+	# save_to_results(noise=noise_vals, n_hidden=n_hidden_vals)
 
 	for i, noise in enumerate(noise_vals):
 		for j, n_hidden in enumerate(n_hidden_vals):
@@ -225,15 +228,30 @@ def pipeline(only_testing=False):
 			print('--------------------------------')
 			t0 = time.time()
 			
-			savedict = load_results()
+			modname = f'gru_nhidden-{n_hidden:d}_nlayers-1_chromatic_noise{noise}'.replace('.', 'p')
 
-			#if 'obs_err_m' not in savedict or np.isnan(savedict['obs_err_m'][i, j, 0]):
-			performance_rnn = main_fitting(noise, n_hidden, only_testing)
-			save_to_results(noise, n_hidden, **performance_rnn)
+			for run_n in range(n_runs):
 
-			#if 'pred_high_m' not in savedict or np.isnan(savedict['pred_high_m'][i, j, 0]):
-			performance_baseline = baselines(noise, n_hidden, only_testing)
-			save_to_results(noise, n_hidden, **performance_baseline)
+				print(f' -- Run {run_n+1}/{n_runs}')
+				#savedict = load_results()
+
+				done = os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth')
+				while not done:
+					try:
+						performance_rnn = main_fitting(noise, n_hidden, only_testing, run_n)
+						done = True
+					except KeyboardInterrupt:
+						raise
+					except RuntimeError as e:
+						print(f'Non-critical error: {e}; re-running...')
+						continue
+				
+				# save_to_results(noise, n_hidden, run_n, **performance_rnn)
+
+				#if 'pred_high_m' not in savedict or np.isnan(savedict['pred_high_m'][i, j, 0]):
+				#performance_baseline = baselines(noise, n_hidden, only_testing)
+				#save_to_results(noise, n_hidden, **performance_baseline)
+
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
@@ -257,7 +275,7 @@ def save_to_results(this_noise=None, this_n_hidden=None, **kwargs):
 		for key in [k for k in kwargs if k not in ['noise', 'n_hidden']]:
 			savedict[key][ix_noise, ix_n, :] = kwargs[key]
 
-	with open('./results/results.pickle', 'wb') as f:
+	with open(f'./results/results.pickle', 'wb') as f:
 		pickle.dump(savedict, f)
 
 
@@ -375,9 +393,9 @@ def load_results():
 
 if __name__ == '__main__':
 	# prepare_data()
-	# pipeline()
+	pipeline()
 	# pipeline(only_testing=True)
-	prediction_error_analysis_pipeline()
+	# prediction_error_analysis_pipeline()
 
 
 # ToDo: 
