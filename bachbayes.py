@@ -135,7 +135,7 @@ class Bachmodel():
 
 	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False):
 		
-		tolerance = 0.5 # loss < validation_loss + tol * std_validation_loss --> early stopping 
+		tolerance = 1 # loss < validation_loss + tol * std_validation_loss --> early stopping 
 		chunker = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
   
 		# Select which parameters to train
@@ -175,9 +175,9 @@ class Bachmodel():
 				# print(f"Batch {batch:04}/{n_batches} | Loss: {loss:.4f}")
 				
 				# Early stopping if we begin to overfit the data when training RNNs
-				if 'rnn' not in freeze and batch > 0.05 * n_batches:
+				if 'rnn' not in freeze and batch > 0.10 * n_batches:
 					
-					ve = self.test(chunk_size, batch_size, 6, obj, self.validation_path)
+					ve = self.test(obj, test_path=self.validation_path)
 					valid_error_m, valid_error_s = np.mean(ve), np.std(ve)
 					cutoff = valid_error_m - tolerance * valid_error_s
 					cutoff_str  = f'{valid_error_m:.2f}' + u'\u00B1' + f'{valid_error_s:.2f}'
@@ -186,7 +186,7 @@ class Bachmodel():
 					avg_loss = np.mean(loss_hist[max(0, batch-10):])
 					
 					if avg_loss < cutoff:
-						print(f'Stopping -> <Loss> = {avg_loss:.2f}, val_loss = {cutoff_str}')
+						print(f' [Early stopping with loss{avg_loss:.2f} < {cutoff_str}] ', end='')
 						break
 
 		self._write_report_(loss_hist, freeze, obj)
@@ -196,9 +196,8 @@ class Bachmodel():
 		if test_path is None:
 			test_path = self.test_path
 
-
 		with torch.no_grad():
-	
+		
 			chunker = Chunker(test_path, 1, None, self.chromatic, self.noise, self.dev)
 			operas  = sorted(chunker.song_pool)
 
