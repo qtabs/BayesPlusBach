@@ -11,9 +11,9 @@ This project kickstarted at [BrainHack Donostia 2024](https://brainhack-donostia
 
 Core library, holding every class the rest of the code builds on:
 
-- `RNN` and `FeedForwardNN`: the two `torch` architectures. The recurrent one (Elman/GRU/LSTM) carries two sigmoid readouts, one for the denoised observation and one for the prediction of the next input; the feedforward one is memory-less and serves as a baseline.
-- `Bachmodel`: wraps a network together with its parameters (noise level, hidden units, chromatic vs. full-range encoding). Handles training (with per-layer freezing, selectable `obs`/`pred` objectives and early stopping on the validation set), testing, weight saving/loading, and extraction of prediction errors and hidden-state trajectories.
-- `Chunker`: data loader. Reads the `.csv` scores into binary piano-roll arrays (12 chromatic pitch classes or 108 MIDI notes), adds Gaussian noise to build the network's input, and serves either random training chunks or whole pieces.
+- `RNN` and `FeedForwardNN`: the two `torch` architectures. The recurrent one (Elman/GRU) carries two sigmoid readouts, one for the denoised observation and one for the prediction of the next input; the feedforward one is memory-less and serves as a baseline.
+- `Bachmodel`: wraps a network together with its parameters (noise level, hidden units, chromatic vs. full-range encoding). Handles training (with per-layer freezing, selectable `obs`/`pred` objectives, and a fixed batch budget with periodic validation and best-checkpoint selection), testing, weight saving/loading, and extraction of prediction errors and hidden-state trajectories.
+- `Chunker`: data loader. Reads the `.csv` scores into binary piano-roll arrays (12 chromatic pitch classes or 108 MIDI notes) and serves either random training chunks (with fresh Gaussian noise drawn on every chunk) or whole pieces (with a fixed noise realisation, for validation/testing).
 - `BWVRetriever`: scraper that crawls public Bach MIDI archives, matches files to their BWV number, parses the MIDI into chord-per-tick target lists, and stores them as `.csv` in `data/`.
 
 ### `pipeline.py` ###

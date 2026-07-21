@@ -1,0 +1,221 @@
+% =========================================================================
+% Materials and methods -- fragment for the PLoS Computational Biology
+% template (\input{methods.tex}). Requires amsmath (loaded by the template).
+% Citation keys are placeholders to be resolved in the project .bib file.
+% =========================================================================
+
+\section*{Materials and methods}
+
+Our experimental logic proceeds in four steps. First, we trained recurrent
+neural networks (RNNs) exclusively to \emph{decode} (denoise) noisy
+observations of a temporally structured stimulus stream---Bach
+compositions---without any explicit predictive objective. Second, we asked
+whether \emph{prediction emerges} as a by-product of this training: freezing
+the network, we probed its hidden state with a linear readout trained to
+report the upcoming stimulus. Third, we \emph{benchmarked} the probed
+prediction accuracy against a ladder of reference models whose expected
+errors are ordered by construction, allowing us to attribute performance to
+specific computational capacities. Fourth, we tested whether \emph{prediction
+errors are encoded} in the population activity of the trained networks, as
+posited by predictive-coding accounts of cortical
+processing~\cite{rao1999predictive,friston2005theory}.
+
+\subsection*{Stimulus corpus}
+
+We assembled a corpus of works by J.~S.~Bach from publicly available MIDI
+archives.\footnote{jsbach.net, metronimo.com, piano-midi.de, sound.jp/bach-ken,
+dardel.info, classicalarchives.com, and suzumidi.com.} Each MIDI file was
+parsed into an event-based sequence of chords: a new element was created
+whenever the set of simultaneously sounding pitches changed, so that the
+sequence index $t$ advances with the musical surface rather than with clock
+time. This discretisation removes tempo and rhythm while preserving the
+harmonic and voice-leading structure of the music. Pitches were collapsed
+into the 12 pitch classes, yielding for each time step a multi-hot binary
+vector $\mathbf{y}_t \in \{0,1\}^{12}$ whose $k$-th component indicates
+whether pitch class $k$ is sounding (mean polyphony $\approx 2.3$
+simultaneous pitch classes). Files belonging to the same composition
+(different arrangements or movements sharing a BWV catalogue number) were
+concatenated, separated by brief silences.
+
+The corpus comprised 700 compositions, split at the composition level into
+training (70\%, 490 works), validation (10\%, 70 works) and test sets (20\%,
+140 works). Splitting by BWV number guarantees that no arrangement or
+movement of a test composition was ever seen during training.
+
+\subsection*{Noise model and decoding task}
+
+Networks never observed the stimulus directly. At each time step the input
+was a noise-corrupted observation
+\begin{equation}
+  \mathbf{x}_t \;=\; \mathbf{y}_t + \sigma\,\boldsymbol{\varepsilon}_t,
+  \qquad \boldsymbol{\varepsilon}_t \sim \mathcal{N}(\mathbf{0}, I_{12}),
+  \label{eq:noise}
+\end{equation}
+with the noise amplitude $\sigma$ treated as an experimental factor spanning
+nine levels: a near-noiseless control ($\sigma = 0.001$) and $\sigma \in
+\{0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0\}$, sampled densely in the range
+where the single-observation discriminability $d' = 1/\sigma$ crosses unity
+and sparsely near the two asymptotic regimes. At the upper end of this range
+the single-step signal-to-noise ratio is far below unity, so that accurate
+decoding is impossible without integrating information over time---the
+regime in which an internal model of the stimulus dynamics becomes
+computationally necessary, in analogy to optimal filtering of a hidden
+dynamical process~\cite{kalman1960}. During training,
+an independent noise realisation was drawn at every presentation of a
+stimulus segment, making the effective training set unbounded and preventing
+memorisation of any particular noise pattern. Validation and test sets used
+fixed noise realisations, making model selection and evaluation
+deterministic.
+
+\subsection*{Network architecture}
+
+The core model was a single-layer gated recurrent unit network
+(GRU~\cite{cho2014gru}) with $n$ hidden units, $n \in \{8, 16, 32, 64, 128,
+256\}$; the smallest size exceeds the stimulus dimensionality, so no network
+was representationally bottlenecked below its input. Two parallel readout heads, each a linear map followed by an
+element-wise sigmoid, projected the hidden state $\mathbf{h}_t \in
+\mathbb{R}^{n}$ to the stimulus space: an \emph{observation head}
+$\hat{\mathbf{y}}_t = \varsigma(W_{o}\mathbf{h}_t + \mathbf{b}_o)$ reporting
+the current chord, and a \emph{prediction head} $\mathbf{p}_t =
+\varsigma(W_{p}\mathbf{h}_t + \mathbf{b}_p)$ reporting the upcoming chord.
+Outputs were treated as independent Bernoulli probabilities over the 12
+pitch classes and scored with the binary cross-entropy (BCE),
+\begin{equation}
+  \mathcal{L}_{\mathrm{obs}}
+    = \big\langle \mathrm{BCE}(\hat{\mathbf{y}}_t, \mathbf{y}_t) \big\rangle_t,
+  \qquad
+  \mathcal{L}_{\mathrm{pred}}
+    = \big\langle \mathrm{BCE}(\mathbf{p}_t, \mathbf{y}_{t+1}) \big\rangle_t,
+  \label{eq:objectives}
+\end{equation}
+where $\langle\cdot\rangle_t$ averages over time steps and pitch classes.
+The hidden state was initialised to zero at the beginning of each sequence.
+
+\subsection*{Stage 1: training to decode}
+
+In the first training stage only the recurrent weights and the observation
+head were optimised, under the decoding objective
+$\mathcal{L}_{\mathrm{obs}}$ alone; the prediction head was frozen at its
+random initialisation and contributed no gradient. Networks were trained
+with Adam~\cite{kingma2015adam} (learning rate $0.02$) on mini-batches of
+512 segments of 512 consecutive time steps, drawn by advancing through
+randomly selected training compositions. Each network received a fixed
+budget of 20{,}000 batches; no early stopping was used, so that every cell
+of the $\sigma \times n$ design received an identical amount of training.
+Decoding error on the validation set was measured every 100 batches, and the
+network state with the lowest validation error was retained as the final
+model (best-checkpoint selection). Five networks with independent random
+initialisations were trained for each of the $9 \times 6$ combinations of
+noise amplitude and network size.
+
+\subsection*{Stage 2: probing for emergent prediction}
+
+To ask whether the decoding-trained networks had learned to anticipate their
+input, we froze the recurrent weights and the observation head and trained
+\emph{only} the linear prediction head, under
+$\mathcal{L}_{\mathrm{pred}}$, for 3{,}000 batches with otherwise identical
+hyperparameters. Because the recurrent dynamics were fixed, this readout
+cannot create new temporal computations: its accuracy is an estimate of the
+predictive information already present in the hidden state. Any prediction
+performance exceeding that of the memoryless reference models below must
+therefore have emerged spontaneously from the denoising objective of
+Stage~1.
+
+\subsection*{Reference models}
+
+Prediction accuracy is only interpretable relative to the intrinsic
+predictability of the stimulus. We therefore constructed a ladder of
+reference models whose expected losses, at their respective optima,
+correspond to conditional entropies of the stimulus process and are
+provably ordered. Writing $H(\cdot\,|\,\cdot)$ for the conditional entropy
+of a pitch class, independence of the observation noise implies the Markov
+chain $\mathbf{x}_t \to \mathbf{y}_t \to \mathbf{y}_{t+1}$, and hence
+\begin{equation}
+  \underbrace{H(\mathbf{y}_{t+1} \,|\, \mathbf{y}_t)}_{\text{Markov-low}}
+  \;\le\;
+  \underbrace{H(\mathbf{y}_{t+1} \,|\, \mathbf{x}_t)}_{\text{Markov-high}}
+  \;\le\;
+  \underbrace{H(\mathbf{y}_{t+1})}_{\text{global distribution}} .
+  \label{eq:ladder}
+\end{equation}
+The corresponding estimators were:
+\begin{description}
+  \item[Global distribution.] The optimal static predictor under the BCE
+  loss: the vector of per-pitch-class marginal frequencies estimated from
+  the training set, constantly predicted at every time step. This model has
+  no access to temporal structure and upper-bounds the error of any
+  informed predictor.
+  \item[Markov-high.] A feedforward network (one hidden layer of 256 units)
+  mapping the noisy observation $\mathbf{x}_t$ to $\mathbf{y}_{t+1}$: the
+  best one-step predictor operating, like the RNN, through the noisy
+  channel, but without memory.
+  \item[Markov-low.] The same architecture mapping the \emph{clean} chord
+  $\mathbf{y}_t$ to $\mathbf{y}_{t+1}$, trained and evaluated with clean
+  input: the best one-step predictor with perfect knowledge of the current
+  state. Its error is independent of $\sigma$ and lower-bounds all
+  first-order predictors.
+  \item[Prediction-trained GRU.] A single-layer GRU of 256 units trained
+  directly on $\mathcal{L}_{\mathrm{pred}}$, providing an empirical
+  estimate of the best prediction attainable by the architecture itself.
+  \item[Memoryless decoder.] For the decoding task, a feedforward network
+  (three hidden layers of 256 units) mapping $\mathbf{x}_t$ to
+  $\mathbf{y}_t$, quantifying how much decoding accuracy is attainable
+  without temporal integration.
+\end{description}
+Because the bound interpretation of Eq~\eqref{eq:ladder} requires reference
+models operating near their optima, all reference models were
+capacity-saturated (256 hidden units, the maximum of the network-size
+sweep) and computed once per noise level, rather than width-matched to each
+RNN of the sweep. They were trained with the same optimiser, batch
+geometry, validation cadence and checkpoint selection as the core networks,
+with a budget of 25{,}000 batches.
+
+\subsection*{Evaluation and statistics}
+
+All models were evaluated on the 140 held-out test compositions, presented
+in full and never seen during training or model selection. The test-set
+noise realisation was generated once from a fixed seed and shared by all
+models and all noise amplitudes (common random numbers: the same
+$\boldsymbol{\varepsilon}$ scaled by $\sigma$), so that comparisons between
+models are paired both by composition and by noise realisation. Performance
+was summarised as the mean BCE per composition; for the core networks,
+per-composition errors were first averaged across the five training runs, so
+that the composition is the unit of analysis throughout. This yields for
+each model a distribution of 140 paired errors. Pairwise comparisons
+between models used
+two-sided Wilcoxon signed-rank tests across test compositions, with effect
+sizes reported as Cohen's $d$ computed with the pooled standard deviation.
+For summary maps spanning the full design, $p$-values were
+Bonferroni-corrected for the $9 \times 6 = 54$ cells of the sweep.
+
+\subsection*{Encoding of prediction errors}
+
+Finally, we asked whether the trained networks explicitly represent their
+own prediction errors, defined at each time step as the deviation of the
+incoming observation from the network's prediction,
+\begin{equation}
+  \mathbf{e}_t \;=\; \mathbf{x}_{t+1} - \mathbf{p}_t .
+  \label{eq:pe}
+\end{equation}
+Note that $\mathbf{e}_t$ is defined with respect to the noisy observation,
+the only signal available to the network, so its magnitude scales with
+$\sigma$. We related the population prediction error $\|\mathbf{e}_t\|^2$ to
+two signatures of the hidden dynamics: the state energy
+$\|\mathbf{h}_{t+1}\|^2$ and the state-change energy $\|\mathbf{h}_{t+1} -
+\mathbf{h}_t\|^2$ (all quantities averaged over their components). For each
+test composition we computed the Pearson correlation between the
+prediction-error time course and each signature. To test whether the full
+error vector, rather than its magnitude alone, is linearly decodable from
+the population, we fitted ordinary least-squares regressions from
+$\mathbf{h}_{t+1}$ (and from $\mathbf{h}_{t+1}-\mathbf{h}_t$) to
+$\mathbf{e}_t$ on the training compositions and evaluated the mean squared
+decoding error on each test composition, against a baseline decoder that
+constantly predicts the training-set mean error vector.
+
+\subsection*{Implementation}
+
+All models were implemented in PyTorch~\cite{paszke2019pytorch}; MIDI
+parsing used mido, and statistical analyses used SciPy and
+scikit-learn~\cite{pedregosa2011sklearn}. The full pipeline---corpus
+retrieval, model training, benchmarking and analysis---is available at
+\url{https://github.com/USERNAME/BayesPlusBach}. % TODO: final repo URL

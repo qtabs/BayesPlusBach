@@ -11,9 +11,10 @@ import seaborn as sns
 def plot_performance_example(noise, n_hidden):
 	
 	savedict = pipeline.load_results()
-	
+
 	i, j   = savedict['noise'].index(noise), savedict['n_hidden'].index(n_hidden)
-	exdict = {k: savedict[k][i, j] for k in savedict if k not in ['noise', 'n_hidden']}
+	exdict = {k: _get_cell_(savedict, k, i, j)
+			  for k in savedict if k not in ['noise', 'n_hidden', 'n_runs']}
 	df     = pd.DataFrame.from_dict(exdict)
 
 	fig, axs = plt.subplots(1, 2, sharey=True, gridspec_kw={'width_ratios': [2/3, 1]})
@@ -57,8 +58,9 @@ def plot_perfomance_summary(main, baseline, vmax=1, plot_cohen=True):
 
 	for six, noise in enumerate(savedict['noise']):
 		for nix, n_hidden in enumerate(savedict['n_hidden']):
-			
-			x, y = savedict[main][six, nix], savedict[baseline][six, nix]
+
+			x = _get_cell_(savedict, main, six, nix)
+			y = _get_cell_(savedict, baseline, six, nix)
 			cohen, pval = _compute_stats_(x, y)
 			values[nix, six] = cohen if plot_cohen else (x-y).mean()
 			annot[nix, six]  = _beautify_annot_(values[nix, six], pval * bonferroni)
@@ -69,7 +71,7 @@ def plot_perfomance_summary(main, baseline, vmax=1, plot_cohen=True):
 		 		cbar=True, cbar_kws={"pad": 0.02}, square=False, 
 		 		xticklabels=savedict['noise'], yticklabels=savedict['n_hidden'])
 	ax.set_ylabel('n hidden units')
-	ax.set_ylabel('noise amplitude')
+	ax.set_xlabel('noise amplitude')
 
 	fig.subplots_adjust(left=0.03, bottom=0.1, right=1.13, top=0.95)
 	fig.set_size_inches(20, 5)
@@ -77,7 +79,7 @@ def plot_perfomance_summary(main, baseline, vmax=1, plot_cohen=True):
 	plt.close()
 
 
-def plot_prederr_example_opera(noise, n_hidden, ex_opera=14):
+def plot_prederr_example_opera(noise, n_hidden, ex_opera=14, run_n=0):
 
 	# Load model and chunker
 	pars = {'datapath'   : '.',
@@ -88,9 +90,9 @@ def plot_prederr_example_opera(noise, n_hidden, ex_opera=14):
 			'mod_type'   : 'gru'}
 
 	m = bachbayes.Bachmodel(pars)
-	m.load_weights('_prediction')
-	
-	chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev)
+	m.load_weights(f'_prediction_run{run_n:02d}')
+
+	chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev, seed=bachbayes.EVAL_SEED)
 	operas = sorted(chunker.song_pool)
 	opname = operas[ex_opera].upper()
 
@@ -210,12 +212,26 @@ def plot_prederr_summary(main, baseline=None, vmax=1, plot_cohen=True):
 		 		cbar=True, cbar_kws={"pad": 0.02}, square=False, 
 		 		xticklabels=pe_dict['noise'], yticklabels=pe_dict['n_hidden'])
 	ax.set_ylabel('n hidden units')
-	ax.set_ylabel('noise amplitude')
+	ax.set_xlabel('noise amplitude')
 
 	fig.subplots_adjust(left=0.03, bottom=0.12, right=1.05, top=0.95)
 	fig.set_size_inches(20, 5)
 	fig.savefig(f'./results/summary_prederr_{main}-{baseline}-{"cohens" if plot_cohen else "nominal"}.pdf')
 	plt.close()
+
+
+def _get_cell_(savedict, key, six, nix):
+
+	# Declared aggregation rule: per-work test error averaged across runs;
+	# the composition is the unit of analysis. Reference-model metrics are
+	# stored once per noise level (no n_hidden or run axes). nanmean allows
+	# plotting partially completed sweeps (missing runs are ignored)
+	arr = savedict[key]
+
+	if arr.ndim == 4:
+		return np.nanmean(arr[six, nix], axis=0)
+
+	return arr[six]
 
 
 def _write_stats_pair_(ax, df, col0, col1, x0, x1, y, up=True):
@@ -303,7 +319,7 @@ def _plot_point_lines_(ax, df, col0, col1, x0, x1):
 
 if __name__ == '__main__':
 	
-	plot_performance_example(0.7, 64)
+	plot_performance_example(0.8, 64)
 	
 	plot_perfomance_summary('obs_high',   'obs_err',  vmax=10,  plot_cohen=True)
 	plot_perfomance_summary('obs_high',   'obs_err',  vmax=0.5, plot_cohen=False)
@@ -312,8 +328,8 @@ if __name__ == '__main__':
 	plot_perfomance_summary('pred_markh', 'pred_err', vmax=5,   plot_cohen=True)
 	plot_perfomance_summary('pred_markh', 'pred_err', vmax=0.1, plot_cohen=False)
 
-	plot_prederr_example_opera(0.7, 64, 14)
-	plot_prederr_example(0.7, 64)
+	plot_prederr_example_opera(0.8, 64, 14)
+	plot_prederr_example(0.8, 64)
 
 	plot_prederr_summary('pe_stm', vmax=20, plot_cohen=True)
 	plot_prederr_summary('pe_std', vmax=20, plot_cohen=True)

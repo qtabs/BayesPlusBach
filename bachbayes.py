@@ -12,8 +12,12 @@ import torch.nn as nn
 import torch.optim as optim
 import zipfile
 from bs4 import BeautifulSoup
-from tqdm import tqdm
 from urllib.parse import urljoin, urlparse, parse_qs
+
+
+# Seed for the frozen evaluation-noise realisations (common random numbers:
+# the same realisation is shared by all models and all noise amplitudes)
+EVAL_SEED = 0
 
 
 # Neural network models
@@ -33,10 +37,8 @@ class RNN(nn.Module):
 			self.rnn = nn.RNN(n_dim, n_hidden, n_layers, batch_first=True).to(self.dev)
 		elif self.unit_type.lower() == 'gru':
 			self.rnn = nn.GRU(n_dim, n_hidden, n_layers, batch_first=True).to(self.dev)
-		elif self.unit_type.lower() == 'lstm':
-			self.rnn = nn.LSTM(n_dim, n_hidden, n_layers, batch_first=True).to(self.dev)
 		else:
-			print(f'Unit type {self.unit_type} not recognised')
+			raise ValueError(f'Unit type {self.unit_type} not recognised (use "elman" or "gru")')
 
 		self.out_obs  = nn.Linear(n_hidden, n_dim, bias=True).to(self.dev)
 		self.sig_obs  = nn.Sigmoid().to(self.dev)
@@ -133,10 +135,10 @@ class Bachmodel():
 		weightpath = self._compose_weightpath_(suffix)
 		return os.path.exists(weightpath)
 
-	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False):
-		
-		tolerance = 0.5 # loss < validation_loss + tol * std_validation_loss --> early stopping 
-		chunker = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
+	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False, suffix='', val_every=100):
+
+		chunker     = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
+		val_chunker = Chunker(self.validation_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
   
 		# Select which parameters to train
 		parameters_to_train = []
@@ -151,9 +153,11 @@ class Bachmodel():
 		optimizer = optim.Adam(parameters_to_train, lr=lr)
 		loss_func = nn.BCELoss()
 		loss_hist = []
+		val_hist  = []
+		best_val, best_batch, best_weights = np.inf, -1, None
 
 		for batch in range(n_batches):
-			
+
 			optimizer.zero_grad()
 			target, sample = chunker.generate_chunk()
 
@@ -163,58 +167,57 @@ class Bachmodel():
 			if 'obs' in obj:
 				loss += loss_func(obs, target)
 			if 'pred' in obj:
-				loss += loss_func(pred[:, :-1], target[:, 1:])				
+				loss += loss_func(pred[:, :-1], target[:, 1:])
 
 			loss.backward()
 			optimizer.step()
 
 			loss_hist += [float(loss.detach().cpu().numpy())]
 
-			if batch % 100 == 0:
+			# Periodic validation with best-checkpoint selection. The training
+			# budget is fixed (no early stopping) so that every model in the
+			# noise x n_hidden sweep receives the same number of batches
+			if batch % val_every == 0 or batch == n_batches - 1:
 
-				# print(f"Batch {batch:04}/{n_batches} | Loss: {loss:.4f}")
-				
-				# Early stopping if we begin to overfit the data when training RNNs
-				if 'rnn' not in freeze and batch > 0.10 * n_batches:
-					
-					ve = self.test(obj, test_path=self.validation_path)
-					valid_error_m, valid_error_s = np.mean(ve), np.std(ve)
-					cutoff = valid_error_m - tolerance * valid_error_s
-					cutoff_str  = f'{valid_error_m:.2f}' + u'\u00B1' + f'{valid_error_s:.2f}'
-					cutoff_str += f' (tol = {tolerance:.2f})'
+				val_error = float(np.mean(self.test(obj, chunker=val_chunker, target_as_input=target_as_input)))
+				val_hist += [val_error]
 
-					avg_loss = np.mean(loss_hist[max(0, batch-10):])
-					
-					if avg_loss < cutoff:
-						print(f' [Early stopping with loss{avg_loss:.2f} < {cutoff_str}] ', end='')
-						break
+				if val_error < best_val:
+					best_val, best_batch = val_error, batch
+					best_weights = copy.deepcopy(self.net.state_dict())
 
-		self._write_report_(loss_hist, freeze, obj)
+		self.net.load_state_dict(best_weights)
+		print(f' [best validation error {best_val:.3f} at batch {best_batch}] ', end='')
 
-	def test(self, obj=['obs'], test_path=None):
+		self._write_report_(loss_hist, freeze, obj, suffix, val_hist)
+
+	def test(self, obj=['obs'], test_path=None, chunker=None, target_as_input=False):
 
 		if test_path is None:
 			test_path = self.test_path
 
 		with torch.no_grad():
-		
-			chunker = Chunker(test_path, 1, None, self.chromatic, self.noise, self.dev)
+
+			if chunker is None:
+				chunker = Chunker(test_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
 			operas  = sorted(chunker.song_pool)
 
-			performance = np.empty(len(operas))
+			performance = np.zeros(len(operas))
 			loss_func   = nn.BCELoss(reduction='none')
 
 			for n, opera in enumerate(operas):
-				
-				target = chunker.read_song_as_tensor(opera)['target']
-				sample = chunker.read_song_as_tensor(opera)['sample']
 
-				obs, pred, _   = self.net(sample)
+				song   = chunker.read_song_as_tensor(opera)
+				target = song['target']
+				sample = song['sample']
 
+				obs, pred, _   = self.net(target if target_as_input else sample)
+
+				# Objectives are summed, mirroring the training loss
 				if 'obs' in obj:
-					performance[n] = loss_func(obs, target).mean().cpu().numpy()
+					performance[n] += loss_func(obs, target).mean().cpu().numpy()
 				if 'pred' in obj:
-					performance[n] = loss_func(pred[:, :-1], target[:, 1:]).mean().cpu().numpy()
+					performance[n] += loss_func(pred[:, :-1], target[:, 1:]).mean().cpu().numpy()
 
 		return performance
 
@@ -223,11 +226,15 @@ class Bachmodel():
 		with torch.no_grad():
 
 			obs, pred, hidden = self.net(sample)
+			if hidden is None:
+				raise ValueError('compute_pe_and_state requires a recurrent model (FeedForwardNN has no hidden state)')
 			pred   = pred.cpu().detach().numpy()
 			obs    = obs.cpu().detach().numpy()
 			hidden = hidden.cpu().detach().numpy()
 			sample = sample.cpu().detach().numpy()
 
+		# PE is measured against the noisy sample (all the network can observe),
+		# so its magnitude scales with the noise parameter
 		pe  = sample[0, 1:] - pred[0, :-1]
 		stm = hidden[0, 1:]
 		std = hidden[0, 1:] - hidden[0, :-1]
@@ -238,19 +245,22 @@ class Bachmodel():
 		
 		with torch.no_grad():
 			# Compute global distribution from training set
-			train_chunker = Chunker(self.train_path, 1, None, self.chromatic, self.noise, self.dev)
+			train_chunker = Chunker(self.train_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
 			train_operas  = sorted(train_chunker.song_pool)
 
 			glob_dist = torch.zeros(self.net.n_dim).to(self.dev)
 			
 			for opera in train_operas:
-				glob_dist += train_chunker.read_song_as_tensor(opera)['sample'].mean((0, 1))
-			
-			glob_dist *= 1/glob_dist.sum()
+				glob_dist += train_chunker.read_song_as_tensor(opera)['target'].mean((0, 1))
+
+			# Per-note marginal P(note on): optimal constant predictor under BCELoss.
+			# (Independent Bernoullis; do NOT normalise to sum to 1.)
+			glob_dist *= 1/len(train_operas)
+			glob_dist  = glob_dist.clamp(1e-6, 1 - 1e-6)
 
 		# Measure performance in the testing set
 		with torch.no_grad():
-			test_chunker = Chunker(self.test_path, 1, None, self.chromatic, self.noise, self.dev)
+			test_chunker = Chunker(self.test_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
 			test_operas  = sorted(test_chunker.song_pool)
 
 			performance = np.empty(len(test_operas))
@@ -262,13 +272,18 @@ class Bachmodel():
 
 		return performance
 
-	def _write_report_(self, loss_hist, freeze, obj):
+	def _write_report_(self, loss_hist, freeze, obj, suffix='', val_hist=None):
 
 		report_name = self.modname
 		report_name += f'_obj-{"-".join(obj)}_'
 		report_name += f'freeze-{"none" if freeze == [] else "-".join(freeze)}'
+		report_name += suffix
 		report_path = os.path.join(os.path.split(self.modpath)[0], report_name) + '.txt'
+
+		# Line 1: training loss per batch; line 2 (if present): validation error per check
 		history_str = ','.join([f'{l:.4f}' for l in loss_hist])
+		if val_hist is not None:
+			history_str += '\n' + ','.join([f'{v:.4f}' for v in val_hist])
 
 		with open(report_path, 'w') as f:
 			f.write(history_str)
@@ -285,8 +300,8 @@ class Bachmodel():
 # Data Loading
 class Chunker():
 
-	def __init__(self, songs_path, batch_size, chunk_size, chromatic, noise, dev=None):
-		
+	def __init__(self, songs_path, batch_size, chunk_size, chromatic, noise, dev=None, seed=None):
+
 		if dev is None:
 			dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -298,6 +313,7 @@ class Chunker():
 		self.chromatic  = chromatic
 		self.noise      = noise
 		self.dev        = dev
+		self.seed       = seed
 
 		self.songs_dict = self._get_songs_()
 		self.song_pool  = list(self.songs_dict.keys())
@@ -307,17 +323,19 @@ class Chunker():
 	def generate_chunk(self):
 		n_dims = self.songs_dict[self.song_pool[0]]['target'].shape[1]
 		target = np.zeros((self.batch_size, self.chunk_size, n_dims))
-		sample = np.zeros((self.batch_size, self.chunk_size, n_dims))
 
 		for n in range(self.batch_size):
 			t0, t1 = self.t0[n], self.t0[n] + self.chunk_size
 			target[n, :, :] = self.songs_dict[self.song_list[n]]['target'][t0:t1]
-			sample[n, :, :] = self.songs_dict[self.song_list[n]]['sample'][t0:t1]
-			if t1 > self.songs_dict[self.song_list[n]]['target'].shape[1]-self.chunk_size:
+			if t1 > self.songs_dict[self.song_list[n]]['target'].shape[0]-self.chunk_size:
 				self.song_list[n] = np.random.choice(self.song_pool)
 				self.t0[n] = 0
 			else:
 				self.t0[n] += self.chunk_size
+
+		# Fresh noise on every chunk: denoising acts as stochastic augmentation,
+		# so the network cannot memorise a fixed noise realisation
+		sample = target + self.noise * np.random.randn(*target.shape)
 
 		target = torch.tensor(target).to(device=self.dev).float()
 		sample = torch.tensor(sample).to(device=self.dev).float()
@@ -361,7 +379,9 @@ class Chunker():
 					targets += [[]] * self.song_end_pad
 
 			target_array = self._generate_target_array_(targets)
-			sample_array = self._add_noise_to_target_(target_array)
+			# Fixed noise realisation, used only when reading whole songs for
+			# validation/testing (training chunks draw fresh noise instead)
+			sample_array = self._add_noise_to_target_(target_array, opera)
 			songs_dict[opera]['target'] = target_array
 			songs_dict[opera]['sample'] = sample_array
 
@@ -383,13 +403,20 @@ class Chunker():
 			notes = [int(note)-1 for note in target_chord if note != '']
 			for target_note in notes:
 				note = target_note % 12 if self.chromatic else target_note
-				target_array[tick, note] = 1
+				if 0 <= note < n_midi_notes:
+					target_array[tick, note] = 1
 
 		return target_array
 
-	def _add_noise_to_target_(self, target_array):
+	def _add_noise_to_target_(self, target_array, opera):
 
-		sample_array = target_array + self.noise * np.random.randn(*target_array.shape)
+		if self.seed is None:
+			rng = np.random
+		else:
+			# Per-song deterministic realisation (independent of file order)
+			rng = np.random.default_rng([self.seed, int(opera[3:])])
+
+		sample_array = target_array + self.noise * rng.standard_normal(target_array.shape)
 
 		return(sample_array)
 
@@ -401,9 +428,10 @@ class BWVRetriever():
 
 		os.makedirs(save_dir, exist_ok=True)
 
-		if opera_list_file is None: 
-			opera_list_file = os.path.join(save_dir, '_list.txt') 
-			open(opera_list_file, 'w').close()
+		if opera_list_file is None:
+			opera_list_file = os.path.join(save_dir, '_list.txt')
+			if not os.path.exists(opera_list_file):
+				open(opera_list_file, 'w').close()
 		
 		self.save_dir        = save_dir
 		self.opera_list_file = opera_list_file
@@ -425,27 +453,27 @@ class BWVRetriever():
 		files_by_prefix = {}
 
 		for filename in os.listdir(self.save_dir):
-		    if filename.endswith('.csv') and '_' in filename:
-		        prefix = filename.split('_')[0]
-		        files_by_prefix.setdefault(prefix, []).append(filename)
+			if filename.endswith('.csv') and '_' in filename:
+				prefix = filename.split('_')[0]
+				files_by_prefix.setdefault(prefix, []).append(filename)
 
 		for prefix, files in files_by_prefix.items():
-		    lengths = {}
-		    for f in files:
-		        file_path = os.path.join(self.save_dir, f)
-		        try:
-		            with open(file_path, 'r') as file:
-		                length = sum(1 for line in file) - 1
+			lengths = {}
+			for f in files:
+				file_path = os.path.join(self.save_dir, f)
+				try:
+					with open(file_path, 'r') as file:
+						length = sum(1 for line in file) - 1
 
-		        except Exception as e:
-		            print(f"Error reading {f}: {e}")
-		            continue
+				except Exception as e:
+					print(f"Error reading {f}: {e}")
+					continue
 
-		        if length in lengths:
-		            os.remove(file_path)
-		            print(f"Deleted duplicate: {f} (same length as {lengths[length]})")
-		        else:
-		            lengths[length] = f
+				if length in lengths:
+					os.remove(file_path)
+					print(f"Deleted duplicate: {f} (same length as {lengths[length]})")
+				else:
+					lengths[length] = f
 	
 	def _scrape_page_(self, base_url, url=None, visited=None):
 
@@ -612,7 +640,7 @@ class BWVRetriever():
 		
 		return opera, fname
 
-	def _save_file_(self, file_url, fname, opera=None, suzumidi=False, filename_to_bwv=None):
+	def _save_file_(self, file_url, fname, opera=None, suzumidi=False):
 	
 		if self.verbose:
 			print(f'saving: {file_url}')
@@ -648,7 +676,8 @@ class BWVRetriever():
 					csv.writer(f).writerows(targets)
 
 			elif os.path.splitext(fname)[1] == '.zip' and suzumidi:
-				
+
+				saved_count = 0
 				with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
 					midi_count = 0
 
@@ -695,15 +724,22 @@ class BWVRetriever():
 								file_name = os.path.join(self.save_dir, new_fname_base + '.csv')
 								with open(file_name, 'w') as f:
 									csv.writer(f).writerows(targets)
+								saved_count += 1
 
 								if self.verbose:
 									print(f"Extracted and saved: {file_name}")
+
+				if saved_count == 0:
+					if self.verbose:
+						print(f"No MIDI files could be extracted from {fname}")
+					return False
 
 			else:
 				# fallback for other file types
 				if os.path.splitext(fname)[1].lower() == '.zip' and not suzumidi:
 					if self.verbose:
 						print(f"Skipping saving ZIP file {fname} because suzumidi=False")
+					return False
 				else:
 					with open(os.path.join(self.save_dir, fname), 'wb') as f:
 						f.write(response.content)
@@ -738,7 +774,11 @@ class BWVRetriever():
 						notes.append(this_note)
 						del pending[el.note]
 
-		# 2) parcelate streams into single-chord boxes 
+		if not notes:
+			print(f"Skipping file with no complete notes: {midi_file}")
+			return None
+
+		# 2) parcelate streams into single-chord boxes
 		mbox = np.nan * np.ones((1, max([note['t1'] for note in notes])))
 		for ix, note in enumerate(notes):
 			t0, t1, n = note['t0'], note['t1'], 0
@@ -775,7 +815,7 @@ class BWVRetriever():
 
 
 
-############
+
 
 
 

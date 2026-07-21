@@ -10,6 +10,18 @@ import scipy.stats as ss
 from sklearn.linear_model import LinearRegression
 
 
+# Sweep design. Noise levels are sampled densely where the single-observation
+# discriminability (d' = 1/sigma) crosses unity, sparsely at the asymptotes;
+# sigma = 0.001 is the near-noiseless control. Hidden sizes start above the
+# stimulus dimensionality (12) so that no cell is a representational bottleneck
+NOISE_VALS    = [0.001, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0]
+N_HIDDEN_VALS = [8, 16, 32, 64, 128, 256]
+N_RUNS        = 10   # storage capacity of the results arrays
+N_RUNS_TRAIN  = 5    # runs trained by default (extendable up to N_RUNS for free:
+                     # pipeline() resumes per run and figures aggregate with nanmean)
+N_REF         = 256  # reference models are capacity-saturated (max of the sweep)
+
+
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 
 	base_urls = ["http://www.jsbach.net/midi/", 
@@ -30,12 +42,24 @@ def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 	retriever.scrape_websites(base_urls)
 	retriever.delete_duplicates()
 
-	operas = [os.path.split(fpath)[1] for fpath in glob.glob(save_dir + '/bwv*.csv')]
+	split_data(test_rat, validation_rat, basedir, save_dir)
+
+
+def split_data(test_rat=0.2, validation_rat=0.1, basedir='.', save_dir='data'):
+
+	# Group files by BWV number so that every version/movement of a composition
+	# lands in the same split (splitting by file leaks pieces across sets)
+	groups = dict()
+	for fpath in glob.glob(os.path.join(save_dir, 'bwv*.csv')):
+		fname = os.path.split(fpath)[1]
+		opera = fname.split('_')[0] if '_' in fname else fname.replace('.csv', '')
+		groups.setdefault(opera, []).append(fname)
+
+	operas = sorted(groups)
+	random.shuffle(operas)
 
 	n_test_samples  = int(np.round(len(operas) * test_rat))
 	n_val_samples   = int(np.round(len(operas) * validation_rat))
-
-	random.shuffle(operas)
 
 	samples = {'test': operas[:n_test_samples],
 			   'validation': operas[n_test_samples:(n_val_samples+n_test_samples)],
@@ -43,9 +67,12 @@ def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
 
 	for key in samples:
 		sample_dir = os.path.join(basedir, key)
-		os.makedirs(sample_dir, exist_ok=True)
+		if os.path.exists(sample_dir):
+			shutil.rmtree(sample_dir)  # clear files from any previous split
+		os.makedirs(sample_dir)
 		for opera in samples[key]:
-			shutil.copy(os.path.join(save_dir, opera), os.path.join(sample_dir, opera))
+			for fname in groups[opera]:
+				shutil.copy(os.path.join(save_dir, fname), os.path.join(sample_dir, fname))
 
 
 def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
@@ -76,14 +103,14 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 		## Training RNN on observation accuracy
 		print('Training on observations...', end='')
 		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'])
+		m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'], suffix=f'_run{run_n:02d}')
 		m.save_weights(f'_observation_run{run_n:02d}')
 		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
 		## Training linear readout on prediction accuracy
 		print('Training on predictions...', end='')
 		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'])
+		m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'], suffix=f'_run{run_n:02d}')
 		m.save_weights(f'_prediction_run{run_n:02d}')
 		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
@@ -108,7 +135,11 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 	return performance
 
 
-def baselines(noise, n_hidden, only_testing=False):
+def baselines(noise, n_hidden=N_REF, only_testing=False):
+
+	# Reference models estimate properties of the task (conditional entropies),
+	# so they are computed once per noise level at saturated capacity rather
+	# than width-matched to each RNN of the sweep
 
 	# Parameters
 	lr = 0.02
@@ -123,46 +154,38 @@ def baselines(noise, n_hidden, only_testing=False):
 				 'noise'      : noise,
 				 'n_hidden'   : n_hidden}
 
+	def fit_or_load(m, suffix, n_batches, **train_kwargs):
+		if only_testing or m.trained_weights_exists(suffix):
+			m.load_weights(suffix)
+		else:
+			t0 = time.time()
+			m.train(lr, chunk_size, batch_size, n_batches, **train_kwargs)
+			m.save_weights(suffix)
+			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+
 
 	# Observations high-bound -> NN one-step
 	pars = {'mod_type': 'feedforward', 'n_layers': 3}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
 
-	if only_testing:
-		m.load_weights('_observation-high')
-	else:
-		print('Benchmarking (observations high bound)...', end='')
-		t0 = time.time()
-		if not m.trained_weights_exists('_observation-high'):
-			m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['obs'])
-			m.save_weights('_observation-high')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
-	
+	print('Benchmarking (observations high bound)...', end='')
+	fit_or_load(m, '_observation-high', max_batches_ff, obj=['obs'])
 	obs_high = m.test(obj=['obs'])
 
 
 	# Predictions high-bound: global distribution
 	print('Benchmarking (predictions high bound)...', end='')
-	t0 = time.time()
 	pred_high = m.test_globaldist_model()
-	print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
 
 	# Predictions markov high bound: 1-back predictions
 	pars = {'mod_type': 'feedforward', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	
-	if only_testing:
-		m.load_weights('_prediction-markov-high')
-	else:
-		print('Benchmarking (predictions markov bound)...', end='')
-		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['pred'])
-		m.save_weights('_prediction-markov-high')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
-			
+
+	print('\nBenchmarking (predictions markov bound)...', end='')
+	fit_or_load(m, '_prediction-markov-high', max_batches_ff, obj=['pred'])
 	pred_markh = m.test(obj=['pred'])
 
 
@@ -171,32 +194,18 @@ def baselines(noise, n_hidden, only_testing=False):
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
 
-	if only_testing:
-		m.load_weights('_prediction-markov-low')
-	else:
-		print('Benchmarking (predictions markov low bound)...', end='')
-		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, max_batches_ff, obj=['pred'], target_as_input=True)
-		m.save_weights('_prediction-markov-low')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
-		
-	pred_markl = m.test(obj=['pred'])
+	print('Benchmarking (predictions markov low bound)...', end='')
+	fit_or_load(m, '_prediction-markov-low', max_batches_ff, obj=['pred'], target_as_input=True)
+	pred_markl = m.test(obj=['pred'], target_as_input=True)
 
 
-	# Predictions low bound 
+	# Predictions low bound
 	pars = {'mod_type': 'gru', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
-	
-	if only_testing:
-		m.load_weights('_prediction-low')
-	else:
-		print('Benchmarking (predictions low bound)...', end='')
-		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, max_batches_rnn, obj=['pred'])
-		m.save_weights('_prediction-low')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
-	
+
+	print('Benchmarking (predictions low bound)...', end='')
+	fit_or_load(m, '_prediction-low', max_batches_rnn, obj=['pred'])
 	pred_low = m.test(obj=['pred'])
 
 
@@ -213,75 +222,104 @@ def baselines(noise, n_hidden, only_testing=False):
 	return performance
 
 
-def pipeline(only_testing=False):
+def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
 
-	noise_vals    = [0.001] + [round(0.1 * n, 2) for n in range(1, 21)]
-	n_hidden_vals = [2**n for n in range(1, 9)]
-	n_runs = 9
+	save_to_results(noise=NOISE_VALS, n_hidden=N_HIDDEN_VALS, n_runs=N_RUNS)
 
-	# save_to_results(noise=noise_vals, n_hidden=n_hidden_vals)
+	for i, noise in enumerate(NOISE_VALS):
+		for j, n_hidden in enumerate(N_HIDDEN_VALS):
 
-	for i, noise in enumerate(noise_vals):
-		for j, n_hidden in enumerate(n_hidden_vals):
-			
-			print(f'\nModel ({i:02},{j:02}) of ({len(noise_vals)},{len(n_hidden_vals)}))')
+			print(f'\nModel ({i:02},{j:02}) of ({len(NOISE_VALS)},{len(N_HIDDEN_VALS)}))')
 			print('--------------------------------')
 			t0 = time.time()
-			
+
 			modname = f'gru_nhidden-{n_hidden:d}_nlayers-1_chromatic_noise{noise}'.replace('.', 'p')
 
 			for run_n in range(n_runs):
 
 				print(f' -- Run {run_n+1}/{n_runs}')
-				#savedict = load_results()
 
-				done = os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth')
+				done = (not only_testing) and os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth')
 				while not done:
 					try:
-						performance_rnn = main_fitting(noise, n_hidden, only_testing, run_n)
+						performance_rnn = main_fitting(noise, n_hidden, run_n=run_n, only_testing=only_testing)
+						save_to_results(noise, n_hidden, run_n, **performance_rnn)
 						done = True
 					except KeyboardInterrupt:
 						raise
 					except RuntimeError as e:
 						print(f'Non-critical error: {e}; re-running...')
 						continue
-				
-				# save_to_results(noise, n_hidden, run_n, **performance_rnn)
-
-				#if 'pred_high_m' not in savedict or np.isnan(savedict['pred_high_m'][i, j, 0]):
-				#performance_baseline = baselines(noise, n_hidden, only_testing)
-				#save_to_results(noise, n_hidden, **performance_baseline)
-
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
 
-def save_to_results(this_noise=None, this_n_hidden=None, **kwargs):
+def baselines_pipeline(only_testing=False):
 
-	if not os.path.exists('./results/results.pickle'):
+	save_to_results(noise=NOISE_VALS, n_hidden=N_HIDDEN_VALS, n_runs=N_RUNS)
+
+	for i, noise in enumerate(NOISE_VALS):
+
+		print(f'\nBaselines for noise {noise} ({i+1}/{len(NOISE_VALS)})')
+		print('--------------------------------')
+		t0 = time.time()
+
+		performance_baseline = baselines(noise, only_testing=only_testing)
+		save_to_results(noise, **performance_baseline)
+
+		print(f'------ baselines took {(time.time() - t0)/60:<5.1f}minutes ------')
+
+
+def save_to_results(this_noise=None, this_n_hidden=None, this_run=None,
+					results_path='./results/results.pickle', **kwargs):
+
+	if not os.path.exists(results_path):
 		savedict = {}
 	else:
-		with open('./results/results.pickle', 'rb') as f:
+		with open(results_path, 'rb') as f:
 			savedict = pickle.load(f)
 
-	savedict.update({key: kwargs[key] for key in ['noise', 'n_hidden'] if key in kwargs})
+	# Axis definitions (init call). Refuse to touch a results file that was
+	# produced under a different design: it must be archived manually first
+	for key in ['noise', 'n_hidden', 'n_runs']:
+		if key in kwargs:
+			if key in savedict and savedict[key] != kwargs[key]:
+				raise ValueError(f'{results_path} has a different "{key}" axis '
+								 f'({savedict[key]} vs {kwargs[key]}); archive it first')
+			savedict[key] = kwargs[key]
 
-	noise, n_hidden = savedict['noise'], savedict['n_hidden']
-	for key in [k for k in kwargs if k not in savedict]: 
-		savedict[key] = np.nan * np.ones((len(noise), len(n_hidden), len(kwargs[key])))
+	metrics = {k: v for k, v in kwargs.items() if k not in ['noise', 'n_hidden', 'n_runs']}
 
-	if this_noise is not None and this_n_hidden is not None:
-		ix_noise, ix_n = noise.index(this_noise), n_hidden.index(this_n_hidden)
-		for key in [k for k in kwargs if k not in ['noise', 'n_hidden']]:
-			savedict[key][ix_noise, ix_n, :] = kwargs[key]
+	noise, n_hidden, n_runs = savedict['noise'], savedict['n_hidden'], savedict['n_runs']
 
-	with open(f'./results/results.pickle', 'wb') as f:
+	for key, value in metrics.items():
+		if this_run is not None:
+			# Per-run network metric: (noise, n_hidden, run, test work)
+			shape = (len(noise), len(n_hidden), n_runs, len(value))
+		else:
+			# Reference-model metric, one per noise level: (noise, test work)
+			shape = (len(noise), len(value))
+		if key not in savedict:
+			savedict[key] = np.full(shape, np.nan)
+		elif savedict[key].shape != shape:
+			raise ValueError(f'{results_path} stores "{key}" with shape '
+							 f'{savedict[key].shape}, expected {shape}; archive it first')
+
+	if this_noise is not None:
+		ix_noise = noise.index(this_noise)
+		for key, value in metrics.items():
+			if this_run is not None:
+				savedict[key][ix_noise, n_hidden.index(this_n_hidden), this_run, :] = value
+			else:
+				savedict[key][ix_noise, :] = value
+
+	with open(results_path, 'wb') as f:
 		pickle.dump(savedict, f)
 
 
-def prediction_error_analysis_pipeline():
+def prediction_error_analysis_pipeline(run_n=0):
 
-	operas   = sorted(bachbayes.Chunker('./test', 1, None, True,0).song_pool)
+	operas   = sorted(bachbayes.Chunker('./test', 1, None, True, 0, seed=bachbayes.EVAL_SEED).song_pool)
 	savedict = load_results()
 	noise_vals    = savedict['noise']
 	n_hidden_vals = savedict['n_hidden']
@@ -311,11 +349,11 @@ def prediction_error_analysis_pipeline():
 					'mod_type'   : 'gru'}
 
 			m = bachbayes.Bachmodel(pars)
-			m.load_weights('_prediction')
+			m.load_weights(f'_prediction_run{run_n:02d}')
 
 
 			# B. Train stats to pe linear regression models
-			tr_chunker = bachbayes.Chunker(m.train_path, 1, None, m.chromatic, m.noise, m.dev)
+			tr_chunker = bachbayes.Chunker(m.train_path, 1, None, m.chromatic, m.noise, m.dev, seed=bachbayes.EVAL_SEED)
 
 			pe_train, stm_train, std_train = [], [], [] 
 
@@ -336,8 +374,8 @@ def prediction_error_analysis_pipeline():
 			reg_d = LinearRegression().fit(std_train, pe_train)
 
 
-			# C. Compute PE and stats in the test set 
-			chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev)
+			# C. Compute PE and stats in the test set
+			chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev, seed=bachbayes.EVAL_SEED)
 			operas  = sorted(chunker.song_pool)
 
 			for nop, opera in enumerate(operas):
@@ -383,9 +421,9 @@ def prediction_error_analysis_pipeline():
 	# ToDo: Enconding of PE+/- --> (np.maximum(-pe,  0)**2).mean(1)
 
 
-def load_results():
+def load_results(results_path='./results/results.pickle'):
 
-	with open('./results/results.pickle', 'rb') as f:
+	with open(results_path, 'rb') as f:
 		savedict = pickle.load(f)
 
 	return savedict
