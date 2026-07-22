@@ -451,6 +451,7 @@ def load_results(results_path='./results/results.pickle'):
 
 if __name__ == '__main__':
 	# prepare_data()
+	baselines_pipeline()
 	pipeline()
 	# prediction_error_analysis_pipeline()
 
