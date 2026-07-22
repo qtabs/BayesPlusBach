@@ -20,6 +20,7 @@ N_RUNS        = 10   # storage capacity of the results arrays
 N_RUNS_TRAIN  = 5    # runs trained by default (extendable up to N_RUNS for free:
                      # pipeline() resumes per run and figures aggregate with nanmean)
 N_REF         = 256  # reference models are capacity-saturated (max of the sweep)
+N_ATTEMPTS    = 3    # tries per run before giving up on it and moving on
 
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
@@ -95,6 +96,27 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 	m = bachbayes.Bachmodel(pars)
 
 
+	def fit_or_load(weight_suffix, n_batches, **train_kwargs):
+
+		# Resume at stage granularity. A stage checkpoint is written only once
+		# train() has spent its whole batch budget and reloaded the best
+		# validation state, so an existing file is always a finished stage and
+		# reloading it is exact, not an approximation. Without this, stopping
+		# during the 3,000-batch prediction stage discarded the 20,000-batch
+		# decoding stage that preceded it.
+		# The report suffix is the run alone: _write_report_ already
+		# disambiguates the two stages by objective and freeze list
+		if m.trained_weights_exists(weight_suffix):
+			m.load_weights(weight_suffix)
+			print(' already trained; loaded from disk')
+			return
+
+		t0 = time.time()
+		m.train(lr, chunk_size, batch_size, n_batches, suffix=f'_run{run_n:02d}', **train_kwargs)
+		m.save_weights(weight_suffix)
+		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+
+
 	# Training
 	if only_testing:
 		m.load_weights(f'_prediction_run{run_n:02d}')
@@ -102,17 +124,13 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 	else:
 		## Training RNN on observation accuracy
 		print('Training on observations...', end='')
-		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, max_batches_obs, freeze=['out_pred'], obj=['obs'], suffix=f'_run{run_n:02d}')
-		m.save_weights(f'_observation_run{run_n:02d}')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		fit_or_load(f'_observation_run{run_n:02d}', max_batches_obs,
+					freeze=['out_pred'], obj=['obs'])
 
 		## Training linear readout on prediction accuracy
 		print('Training on predictions...', end='')
-		t0 = time.time()
-		m.train(lr, chunk_size, batch_size, n_batches_pred, freeze=['rnn', 'out_obs'], obj=['pred'], suffix=f'_run{run_n:02d}')
-		m.save_weights(f'_prediction_run{run_n:02d}')
-		print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
+		fit_or_load(f'_prediction_run{run_n:02d}', n_batches_pred,
+					freeze=['rnn', 'out_obs'], obj=['pred'])
 
 
 	# Testing
@@ -239,17 +257,20 @@ def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
 
 				print(f' -- Run {run_n+1}/{n_runs}')
 
-				done = (not only_testing) and os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth')
-				while not done:
+				if not only_testing and os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth'):
+					continue
+
+				for attempt in range(N_ATTEMPTS):
 					try:
 						performance_rnn = main_fitting(noise, n_hidden, run_n=run_n, only_testing=only_testing)
 						save_to_results(noise, n_hidden, run_n, **performance_rnn)
-						done = True
-					except KeyboardInterrupt:
-						raise
+						break
 					except RuntimeError as e:
-						print(f'Non-critical error: {e}; re-running...')
-						continue
+						# Usually memory pressure, which retrying will not clear.
+						# After a few tries move on to the next run: this one
+						# leaves no checkpoint behind, so re-running pipeline()
+						# later picks it up again
+						print(f'Attempt {attempt+1}/{N_ATTEMPTS} failed: {e}')
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
@@ -270,8 +291,7 @@ def baselines_pipeline(only_testing=False):
 		print(f'------ baselines took {(time.time() - t0)/60:<5.1f}minutes ------')
 
 
-def save_to_results(this_noise=None, this_n_hidden=None, this_run=None,
-					results_path='./results/results.pickle', **kwargs):
+def save_to_results(this_noise=None, this_n_hidden=None, this_run=None, results_path='./results/results.pickle', **kwargs):
 
 	if not os.path.exists(results_path):
 		savedict = {}
@@ -432,7 +452,6 @@ def load_results(results_path='./results/results.pickle'):
 if __name__ == '__main__':
 	# prepare_data()
 	pipeline()
-	# pipeline(only_testing=True)
 	# prediction_error_analysis_pipeline()
 
 
