@@ -1,3 +1,11 @@
+import os
+# Pin to the RTX 4000 Ada (GPU 0). This box also carries a Turing T400 (GPU 1);
+# leaving both GPUs visible triggers intermittent cuDNN RNN-backward failures
+# (CUDNN_STATUS_INTERNAL_ERROR) on the mixed-architecture setup. Must run before
+# torch is imported (via bachbayes) to take effect. Override on the command line
+# if ever needed, e.g. CUDA_VISIBLE_DEVICES=1 python3 pipeline.py
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 import bachbayes
 import glob
 import numpy as np
