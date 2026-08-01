@@ -7,6 +7,7 @@ import mido
 import os
 import re
 import requests
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,6 +19,22 @@ from urllib.parse import urljoin, urlparse, parse_qs
 # Seed for the frozen evaluation-noise realisations (common random numbers:
 # the same realisation is shared by all models and all noise amplitudes)
 EVAL_SEED = 0
+
+# Divergence handling in train(). A run that reaches a state where the backward
+# pass overflows cannot be stepped any further, so it restarts from its last
+# validated checkpoint; if that keeps happening the run stops early and keeps
+# the best checkpoint, which is worth more than the remaining batches
+MAX_BAD_STREAK = 10   # consecutive unusable gradients before rolling back
+MAX_ROLLBACKS  = 5    # rollbacks before giving up and keeping the best weights
+
+# Floor/ceiling on the probabilities the networks emit. In float32 a sigmoid
+# saturates to exactly 1.0 once its logit passes ~17, at which point BCELoss
+# reports its arbitrary -100 clamp and its gradient, which goes as 1/(p(1-p)),
+# degenerates: a single confident unit contradicted by a noisy target produced
+# gradient norms ~1e7 times the usual ones, wrecking the weights and leaving
+# NaNs that trip the BCELoss device-side assert. Same bound already used for
+# the global-distribution baseline in test_globaldist_model()
+P_EPS = 1e-6
 
 
 # Neural network models
@@ -58,8 +75,9 @@ class RNN(nn.Module):
 
 		self.init_hidden(x.shape[0])
 		x, self.hidden = self.rnn(x, self.hidden)
-		x_obs  = self.sig_obs(self.out_obs(x))
-		x_pred = self.sig_pred(self.out_pred(x))
+		# Keeping the outputs off 0 and 1 bounds the BCELoss gradient (see P_EPS)
+		x_obs  = self.sig_obs(self.out_obs(x)).clamp(P_EPS, 1 - P_EPS)
+		x_pred = self.sig_pred(self.out_pred(x)).clamp(P_EPS, 1 - P_EPS)
 
 		return x_obs, x_pred, x
 
@@ -84,7 +102,7 @@ class FeedForwardNN(nn.Module):
 		self.feedforward = nn.Sequential(*layers).to(self.dev)
 
 	def forward(self, x):
-		x = self.feedforward(x) 
+		x = self.feedforward(x).clamp(P_EPS, 1 - P_EPS)
 		# x serves as either inferred value or prediction
 		return x, x, None
 
@@ -135,7 +153,7 @@ class Bachmodel():
 		weightpath = self._compose_weightpath_(suffix)
 		return os.path.exists(weightpath)
 
-	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False, suffix='', val_every=100):
+	def train(self, lr, chunk_size, batch_size, n_batches, freeze=[], obj=['obs'], target_as_input=False, suffix='', val_every=100, report_every=1000, grad_clip=1.0):
 
 		chunker     = Chunker(self.train_path,batch_size,chunk_size,self.chromatic,self.noise,self.dev)
 		val_chunker = Chunker(self.validation_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
@@ -155,6 +173,22 @@ class Bachmodel():
 		loss_hist = []
 		val_hist  = []
 		best_val, best_batch, best_weights = np.inf, -1, None
+		n_rescued, n_clipped, n_rollbacks, bad_streak = 0, 0, 0, 0
+		t_start = time.time()
+
+		def rollback(batch, why):
+			# Return to the last validated checkpoint and rebuild the optimiser:
+			# a diverged step poisons Adam's moment estimates as well
+			nonlocal optimizer, n_rollbacks, bad_streak
+			if best_weights is None:
+				raise RuntimeError(f'{why} at batch {batch}, before any '
+								   f'validation checkpoint exists')
+			self.net.load_state_dict(best_weights)
+			optimizer   = optim.Adam(parameters_to_train, lr=lr)
+			n_rollbacks += 1
+			bad_streak   = 0
+			print(f'   [{why} at batch {batch}: rolled back to batch {best_batch} '
+				  f'(rollback {n_rollbacks}/{MAX_ROLLBACKS})]', flush=True)
 
 		for batch in range(n_batches):
 
@@ -163,6 +197,20 @@ class Bachmodel():
 
 			obs, pred, _ = self.net(target if target_as_input else sample)
 
+			# BCELoss checks its input on the device: handing it a non-finite
+			# value trips a CUDA assert that poisons the context and kills the
+			# whole process, losing the ~40 minutes of the run so far. Catch it
+			# here instead and roll back to the last validated checkpoint --
+			# one batch is cheap, the run is not. Costs one sync per batch,
+			# which the loss readout below incurs anyway
+			outputs = ([obs] if 'obs' in obj else []) + ([pred] if 'pred' in obj else [])
+			if not all(bool(torch.isfinite(o).all()) for o in outputs):
+				n_rescued += 1
+				rollback(batch, 'non-finite output')
+				if n_rollbacks >= MAX_ROLLBACKS:
+					break
+				continue
+
 			loss = 0
 			if 'obs' in obj:
 				loss += loss_func(obs, target)
@@ -170,6 +218,34 @@ class Bachmodel():
 				loss += loss_func(pred[:, :-1], target[:, 1:])
 
 			loss.backward()
+
+			# Sigmoid + BCELoss has an unbounded gradient: d/dp of the loss goes
+			# as 1/(p(1-p)), so once the network is confident and a noisy target
+			# contradicts it, a single batch can produce a gradient norm ~1e7
+			# times the usual one. That step wrecks the weights (and inflates
+			# Adam's second moment), and the batch after it forward-propagates
+			# NaNs. Clipping is a no-op in normal operation -- measured norms
+			# stay under 0.5, so the training dynamics are unchanged except at
+			# the pathological spikes this is here to absorb
+			grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters_to_train, grad_clip))
+			if not np.isfinite(grad_norm):
+				# Skipping the step keeps the weights intact, but weights that
+				# overflow the backward pass once tend to do it on every batch
+				# afterwards: a lone skip would leave the run alive and frozen,
+				# burning the rest of its budget on batches it cannot use. A
+				# short streak means the state itself is unusable -- go back to
+				# the last checkpoint instead
+				n_rescued  += 1
+				bad_streak += 1
+				if bad_streak >= MAX_BAD_STREAK:
+					rollback(batch, f'{bad_streak} consecutive non-finite gradients')
+					if n_rollbacks >= MAX_ROLLBACKS:
+						break
+				continue
+
+			bad_streak = 0
+			n_clipped += grad_norm > grad_clip
+
 			optimizer.step()
 
 			loss_hist += [float(loss.detach().cpu().numpy())]
@@ -186,8 +262,22 @@ class Bachmodel():
 					best_val, best_batch = val_error, batch
 					best_weights = copy.deepcopy(self.net.state_dict())
 
+			# Heartbeat. A stage runs for tens of minutes; without this there is
+			# no way to tell a working run from a hung one
+			if report_every and batch and batch % report_every == 0:
+				elapsed = (time.time() - t_start) / 60
+				eta     = elapsed * (n_batches - batch) / batch
+				print(f'   batch {batch:6d}/{n_batches} ({100*batch/n_batches:3.0f}%)  '
+					  f'loss {np.mean(loss_hist[-report_every:]):.3f}  '
+					  f'val {val_hist[-1]:.3f}  '
+					  f'{elapsed:.1f} min elapsed, ~{eta:.0f} min left', flush=True)
+
 		self.net.load_state_dict(best_weights)
-		print(f' [best validation error {best_val:.3f} at batch {best_batch}] ', end='')
+		notes  = f', {n_clipped} gradient(s) clipped' if n_clipped else ''
+		notes += f', {n_rescued} batch(es) rescued' if n_rescued else ''
+		notes += f', {n_rollbacks} rollback(s)' if n_rollbacks else ''
+		notes += f', stopped early at batch {batch}' if n_rollbacks >= MAX_ROLLBACKS else ''
+		print(f'   [best validation error {best_val:.3f} at batch {best_batch}{notes}]', end='')
 
 		self._write_report_(loss_hist, freeze, obj, suffix, val_hist)
 

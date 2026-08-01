@@ -6,6 +6,13 @@ import os
 # if ever needed, e.g. CUDA_VISIBLE_DEVICES=1 python3 pipeline.py
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
+# Let the caching allocator grow/reuse segments instead of demanding one
+# contiguous block. baselines() builds five models per noise level in a single
+# process; without this the arena fragments and the GRU low-bound (built last,
+# largest backward workspace) fails to allocate -- which cuDNN surfaces as
+# CUDNN_STATUS_INTERNAL_ERROR from the backward pass. Must precede torch import.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import bachbayes
 import glob
 import numpy as np
@@ -14,8 +21,20 @@ import pickle
 import random
 import shutil
 import time
+import torch
 import scipy.stats as ss
 from sklearn.linear_model import LinearRegression
+
+
+# History: the GRU low-bound baseline crashed mid-training with
+# CUDNN_STATUS_INTERNAL_ERROR from the backward pass. It is NOT the mixed-GPU
+# issue the pin above targets (it fired with only GPU 0 visible) and NOT the
+# cuDNN version (it survived the 8.9.2 -> 9.1 upgrade under torch 2.5.1+cu121):
+# it is allocator fragmentation from building five models per noise level in one
+# process. Mitigated by PYTORCH_CUDA_ALLOC_CONF=expandable_segments above plus
+# freeing each model in baselines() before the next. If it ever recurs, the
+# escape hatch is `torch.backends.cudnn.enabled = False` (native RNN kernels:
+# robust but ~7x slower).
 
 
 # Sweep design. Noise levels are sampled densely where the single-observation
@@ -116,7 +135,7 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 		# disambiguates the two stages by objective and freeze list
 		if m.trained_weights_exists(weight_suffix):
 			m.load_weights(weight_suffix)
-			print(' already trained; loaded from disk')
+			print('   already trained; loaded from disk')
 			return
 
 		t0 = time.time()
@@ -131,12 +150,14 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 
 	else:
 		## Training RNN on observation accuracy
-		print('Training on observations...', end='')
+		# Newline, not end='': train() reports progress on its own lines, and a
+		# stage runs long enough that a silent terminal reads as a hang
+		print(f'Training on observations ({max_batches_obs} batches)...')
 		fit_or_load(f'_observation_run{run_n:02d}', max_batches_obs,
 					freeze=['out_pred'], obj=['obs'])
 
 		## Training linear readout on prediction accuracy
-		print('Training on predictions...', end='')
+		print(f'Training on predictions ({n_batches_pred} batches)...')
 		fit_or_load(f'_prediction_run{run_n:02d}', n_batches_pred,
 					freeze=['rnn', 'out_obs'], obj=['pred'])
 
@@ -206,6 +227,9 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 
 
 	# Predictions markov high bound: 1-back predictions
+	# Release the previous model's GPU blocks before building the next so the
+	# arena does not fragment across the five models (see preamble note)
+	del m; torch.cuda.empty_cache()
 	pars = {'mod_type': 'feedforward', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
@@ -216,6 +240,7 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 
 
 	# Predictions markov low bound: 1-back predictions with ground-truth state
+	del m; torch.cuda.empty_cache()
 	pars = {'mod_type': 'feedforward', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
@@ -226,6 +251,7 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 
 
 	# Predictions low bound
+	del m; torch.cuda.empty_cache()
 	pars = {'mod_type': 'gru', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
@@ -246,6 +272,17 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 
 
 	return performance
+
+
+def _is_cuda_context_error_(exception):
+
+	# Device-side asserts and generic CUDA errors are unrecoverable in-process:
+	# the context is gone and every subsequent kernel launch fails. OOM is not
+	# in this list -- it is recoverable once the offending tensors are freed
+	msg = str(exception).lower()
+	unrecoverable = ['device-side assert', 'cuda error', 'cudnn_status', 'cublas']
+
+	return any(marker in msg for marker in unrecoverable) and 'out of memory' not in msg
 
 
 def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
@@ -274,10 +311,20 @@ def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
 						save_to_results(noise, n_hidden, run_n, **performance_rnn)
 						break
 					except RuntimeError as e:
-						# Usually memory pressure, which retrying will not clear.
-						# After a few tries move on to the next run: this one
-						# leaves no checkpoint behind, so re-running pipeline()
-						# later picks it up again
+						# A CUDA fault leaves the context unusable for the rest
+						# of the process: every later run would fail instantly
+						# and the sweep would churn through hundreds of bogus
+						# attempts. Bail out so run_pipeline.sh restarts with a
+						# fresh interpreter, which resumes from the checkpoints
+						if _is_cuda_context_error_(e):
+							print(f'CUDA context lost ({e}); aborting so the '
+								  f'process can be restarted clean')
+							raise
+
+						# Otherwise usually memory pressure, which retrying will
+						# not clear. After a few tries move on to the next run:
+						# this one leaves no checkpoint behind, so re-running
+						# pipeline() later picks it up again
 						print(f'Attempt {attempt+1}/{N_ATTEMPTS} failed: {e}')
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
@@ -459,8 +506,8 @@ def load_results(results_path='./results/results.pickle'):
 
 if __name__ == '__main__':
 	# prepare_data()
-	baselines_pipeline()
 	pipeline()
+	baselines_pipeline()
 	# prediction_error_analysis_pipeline()
 
 
