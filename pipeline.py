@@ -42,9 +42,11 @@ from sklearn.linear_model import LinearRegression
 # at the asymptotes; sigma = 0.001 is the near-noiseless control. That grid put
 # the prediction-error minimum at its own lower edge (sigma = 0.2, with nothing
 # between it and the control), so 0.05, 0.1 and 0.3 refine the region where the
-# effect actually lives, d' ~ 3-20. Hidden sizes start above the stimulus
-# dimensionality (12) so that no cell is a representational bottleneck
-NOISE_VALS    = [0.001, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0]
+# effect actually lives, d' ~ 3-20. Those showed the benefit switches on
+# abruptly between 0.1 (absent) and 0.2 (full), so 0.15 and 0.25 resolve the
+# step itself and the position of the peak. Hidden sizes start above the
+# stimulus dimensionality (12) so that no cell is a representational bottleneck
+NOISE_VALS    = [0.001, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0]
 N_HIDDEN_VALS = [8, 16, 32, 64, 128, 256]
 N_RUNS        = 10   # storage capacity of the results arrays
 N_RUNS_TRAIN  = 5    # runs trained by default (extendable up to N_RUNS for free:
