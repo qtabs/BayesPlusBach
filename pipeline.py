@@ -1,18 +1,4 @@
 import os
-# Pin to the RTX 4000 Ada (GPU 0). This box also carries a Turing T400 (GPU 1);
-# leaving both GPUs visible triggers intermittent cuDNN RNN-backward failures
-# (CUDNN_STATUS_INTERNAL_ERROR) on the mixed-architecture setup. Must run before
-# torch is imported (via bachbayes) to take effect. Override on the command line
-# if ever needed, e.g. CUDA_VISIBLE_DEVICES=1 python3 pipeline.py
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
-# Let the caching allocator grow/reuse segments instead of demanding one
-# contiguous block. baselines() builds five models per noise level in a single
-# process; without this the arena fragments and the GRU low-bound (built last,
-# largest backward workspace) fails to allocate -- which cuDNN surfaces as
-# CUDNN_STATUS_INTERNAL_ERROR from the backward pass. Must precede torch import.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import bachbayes
 import glob
 import numpy as np
@@ -25,34 +11,18 @@ import torch
 import scipy.stats as ss
 from sklearn.linear_model import RidgeCV
 
-
-# History: the GRU low-bound baseline crashed mid-training with
-# CUDNN_STATUS_INTERNAL_ERROR from the backward pass. It is NOT the mixed-GPU
-# issue the pin above targets (it fired with only GPU 0 visible) and NOT the
-# cuDNN version (it survived the 8.9.2 -> 9.1 upgrade under torch 2.5.1+cu121):
-# it is allocator fragmentation from building five models per noise level in one
-# process. Mitigated by PYTORCH_CUDA_ALLOC_CONF=expandable_segments above plus
-# freeing each model in baselines() before the next. If it ever recurs, the
-# escape hatch is `torch.backends.cudnn.enabled = False` (native RNN kernels:
-# robust but ~7x slower).
-
-
-# Sweep design. The first nine levels sampled densely where the
-# single-observation discriminability (d' = 1/sigma) crosses unity and sparsely
-# at the asymptotes; sigma = 0.001 is the near-noiseless control. That grid put
-# the prediction-error minimum at its own lower edge (sigma = 0.2, with nothing
-# between it and the control), so 0.05, 0.1 and 0.3 refine the region where the
-# effect actually lives, d' ~ 3-20. Those showed the benefit switches on
-# abruptly between 0.1 (absent) and 0.2 (full), so 0.15 and 0.25 resolve the
-# step itself and the position of the peak. Hidden sizes start above the
-# stimulus dimensionality (12) so that no cell is a representational bottleneck
+## Main analysis
 NOISE_VALS    = [0.001, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0]
 N_HIDDEN_VALS = [8, 16, 32, 64, 128, 256]
 N_RUNS        = 10   # storage capacity of the results arrays
 N_RUNS_TRAIN  = 5    # runs trained by default (extendable up to N_RUNS for free:
-                     # pipeline() resumes per run and figures aggregate with nanmean)
 N_REF         = 256  # reference models are capacity-saturated (max of the sweep)
-N_ATTEMPTS    = 3    # tries per run before giving up on it and moving on
+
+## PE analysis
+# 'raw' == innovation; 'sig' == signal component; 'neg' == omission component
+PE_TARGETS  = ['raw', 'sig', 'neg']
+# Control ladder: 'b' == constant decoder; 'x' == observation; 'h' == hidden state
+PE_DECODERS = ['b', 'x', 'h']
 
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
@@ -130,12 +100,7 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 
 	def fit_or_load(weight_suffix, n_batches, **train_kwargs):
 
-		# Resume at stage granularity. A stage checkpoint is written only once
-		# train() has spent its whole batch budget and reloaded the best
-		# validation state, so an existing file is always a finished stage and
-		# reloading it is exact, not an approximation. Without this, stopping
-		# during the 3,000-batch prediction stage discarded the 20,000-batch
-		# decoding stage that preceded it.
+		# Resume at stage granularity.
 		# The report suffix is the run alone: _write_report_ already
 		# disambiguates the two stages by objective and freeze list
 		if m.trained_weights_exists(weight_suffix):
@@ -155,8 +120,6 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 
 	else:
 		## Training RNN on observation accuracy
-		# Newline, not end='': train() reports progress on its own lines, and a
-		# stage runs long enough that a silent terminal reads as a hang
 		print(f'Training on observations ({max_batches_obs} batches)...')
 		fit_or_load(f'_observation_run{run_n:02d}', max_batches_obs,
 					freeze=['out_pred'], obj=['obs'])
@@ -166,11 +129,9 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 		fit_or_load(f'_prediction_run{run_n:02d}', n_batches_pred,
 					freeze=['rnn', 'out_obs'], obj=['pred'])
 
-
 	# Testing
 	obs_error  = m.test(obj=['obs'])
 	pred_error = m.test(obj=['pred'])
-
 
 	# Reporting
 	obs_err_m,  obs_err_e  = obs_error.mean(),  obs_error.std()
@@ -183,15 +144,12 @@ def main_fitting(noise, n_hidden, run_n=0, only_testing=False):
 
 	performance = {'obs_err': obs_error, 'pred_err': pred_error}
 
-
 	return performance
 
 
 def baselines(noise, n_hidden=N_REF, only_testing=False):
 
-	# Reference models estimate properties of the task (conditional entropies),
-	# so they are computed once per noise level at saturated capacity rather
-	# than width-matched to each RNN of the sweep
+	# Reference models estimate properties of the task (conditional entropies)
 
 	# Parameters
 	lr = 0.02
@@ -205,14 +163,11 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 				 'noise'      : noise,
 				 'n_hidden'   : n_hidden}
 
-	# The three memoryless one-step references are per-class logistic regressions
-	# (bachbayes.LogisticModel). They replaced feedforward nets, which are
-	# non-convex and diverged to a saturated constant output at high noise; the
-	# logistic fit is convex and never exceeds the marginal. Objective and
-	# target_as_input pick the mapping exactly as they do for the RNN
 	def logistic_ref(name, suffix, obj, target_as_input=False):
+
 		m = bachbayes.LogisticModel({'datapath': '.', 'chromatic': True, 'noise': noise})
 		print(f'Benchmarking ({name})...', end='')
+
 		if only_testing or m.trained_weights_exists(suffix):
 			m.load_weights(suffix)
 		else:
@@ -221,29 +176,29 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 			m.save_weights(suffix)
 			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes', end='')
 		print()
+
 		return m.test(obj=obj, target_as_input=target_as_input)
 
 	def fit_or_load(m, suffix, n_batches, **train_kwargs):
+
 		if only_testing or m.trained_weights_exists(suffix):
 			m.load_weights(suffix)
+
 		else:
 			t0 = time.time()
 			m.train(lr, chunk_size, batch_size, n_batches, **train_kwargs)
 			m.save_weights(suffix)
 			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
-
 	# Observations high bound: memoryless logistic decoder (x_t -> y_t)
 	obs_high = logistic_ref('observations high bound', '_observation-high', obj=['obs'])
 
-	# Predictions high bound: global distribution (marginal predictor). The net is
-	# never used - test_globaldist_model reads only the corpus - but Bachmodel is
-	# where that estimator lives, so a minimal instance carries it
+	# Predictions high bound: global distribution (marginal predictor)
 	print('Benchmarking (predictions high bound)...', end='')
 	gd = bachbayes.Bachmodel({'mod_type': 'feedforward', 'n_layers': 1, **base_pars})
 	pred_high = gd.test_globaldist_model()
 	print()
-	del gd; torch.cuda.empty_cache()
+	del gd
 
 	# Predictions Markov high bound: logistic 1-step from noisy input (x_t -> y_{t+1})
 	pred_markh = logistic_ref('predictions markov high bound', '_prediction-markov-high', obj=['pred'])
@@ -260,8 +215,7 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 	print('Benchmarking (predictions low bound)...', end='')
 	fit_or_load(m, '_prediction-low', max_batches_rnn, obj=['pred'])
 	pred_low = m.test(obj=['pred'])
-	del m; torch.cuda.empty_cache()
-
+	del m
 
 	# Reporting
 	performance  = {'obs_high':   obs_high,
@@ -270,19 +224,7 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 			 		'pred_markl': pred_markl,
 			 		'pred_low':   pred_low}
 
-
 	return performance
-
-
-def _is_cuda_context_error_(exception):
-
-	# Device-side asserts and generic CUDA errors are unrecoverable in-process:
-	# the context is gone and every subsequent kernel launch fails. OOM is not
-	# in this list -- it is recoverable once the offending tensors are freed
-	msg = str(exception).lower()
-	unrecoverable = ['device-side assert', 'cuda error', 'cudnn_status', 'cublas']
-
-	return any(marker in msg for marker in unrecoverable) and 'out of memory' not in msg
 
 
 def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
@@ -305,27 +247,8 @@ def pipeline(only_testing=False, n_runs=N_RUNS_TRAIN):
 				if not only_testing and os.path.exists(f'./models/{modname}_prediction_run{run_n:02d}.pth'):
 					continue
 
-				for attempt in range(N_ATTEMPTS):
-					try:
-						performance_rnn = main_fitting(noise, n_hidden, run_n=run_n, only_testing=only_testing)
-						save_to_results(noise, n_hidden, run_n, **performance_rnn)
-						break
-					except RuntimeError as e:
-						# A CUDA fault leaves the context unusable for the rest
-						# of the process: every later run would fail instantly
-						# and the sweep would churn through hundreds of bogus
-						# attempts. Bail out so run_pipeline.sh restarts with a
-						# fresh interpreter, which resumes from the checkpoints
-						if _is_cuda_context_error_(e):
-							print(f'CUDA context lost ({e}); aborting so the '
-								  f'process can be restarted clean')
-							raise
-
-						# Otherwise usually memory pressure, which retrying will
-						# not clear. After a few tries move on to the next run:
-						# this one leaves no checkpoint behind, so re-running
-						# pipeline() later picks it up again
-						print(f'Attempt {attempt+1}/{N_ATTEMPTS} failed: {e}')
+				performance_rnn = main_fitting(noise, n_hidden, run_n=run_n, only_testing=only_testing)
+				save_to_results(noise, n_hidden, run_n, **performance_rnn)
 
 			print(f'------ model took {(time.time() - t0)/60:<5.1f}minutes ------')
 
@@ -392,18 +315,6 @@ def save_to_results(this_noise=None, this_n_hidden=None, this_run=None, results_
 		pickle.dump(savedict, f)
 
 
-# Decoding targets of the prediction-error analysis (see compute_pe_terms):
-# 'raw' is the network-visible innovation, 'sig' its signal component and 'neg'
-# the expected-but-absent (omission) component
-PE_TARGETS  = ['raw', 'sig', 'neg']
-
-# The control ladder: a constant decoder ('b'), a decoder from the current
-# observation alone ('x'), and a decoder from the hidden state ('h'). Encoding of
-# prediction errors beyond input drive requires state > input-only, since the
-# state necessarily carries the observation it has just consumed
-PE_DECODERS = ['b', 'x', 'h']
-
-
 def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/pe_results.pickle'):
 
 	savedict      = load_results()
@@ -449,16 +360,9 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 						'n_layers': 1, 'n_hidden': n_hidden, 'mod_type': 'gru'}
 
 				m = bachbayes.Bachmodel(pars)
-				try:
-					m.load_weights(f'_prediction_run{run_n:02d}')
-				except FileNotFoundError:
-					print(' weights missing; skipping')
-					continue
+				m.load_weights(f'_prediction_run{run_n:02d}')
 
-				# B. Fit the decoders on the validation split (silence masked). The
-				# training corpus shaped the network's weights, and 70 works are
-				# ample for a linear map, so the fit stays out of both the training
-				# and the test data
+				# B. Fit the decoders on the validation split (silence masked). 
 				feats = {'x': [], 'h': []}
 				targs = {t: [] for t in PE_TARGETS}
 
@@ -474,19 +378,6 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 				feats = {k: np.concatenate(v) for k, v in feats.items()}
 				targs = {k: np.concatenate(v) for k, v in targs.items()}
 
-				# Ridge, not ordinary least squares: hidden states are strongly
-				# collinear (condition number ~1e8 at 256 units), and the OLS
-				# solution then carries huge cancelling coefficients that fit the
-				# fitting split and diverge on the test set - one 256-unit run
-				# reached a test MSE of 4.0 against a constant-decoder baseline of
-				# 0.1. The penalty is chosen by leave-one-out CV over a log grid,
-				# independently per output dimension, and the same estimator is
-				# used for the input-only control so that neither side of the
-				# comparison is favoured.
-				#
-				# The three targets share a design matrix, so they are stacked into
-				# one multi-output fit per decoder: the expensive decomposition is
-				# then done once instead of three times
 				width    = targs[PE_TARGETS[0]].shape[1]
 				stacked  = np.hstack([targs[t] for t in PE_TARGETS])
 				reg      = {d: RidgeCV(alphas=np.logspace(-3, 3, 7), alpha_per_target=True)
@@ -505,15 +396,10 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 					if mk.sum() < 10:
 						continue
 
-					# Innovation-driven updating: the magnitude of the visible
-					# innovation against the magnitude of the state update - the
-					# hallmark of Kalman-style filtering
 					pe2  = (terms['pe_raw'][mk] ** 2).mean(1)
 					std2 = (terms['std'][mk] ** 2).mean(1)
 					results['pe_std'][six, nix, run_n, nop] = ss.pearsonr(pe2, std2)[0]
 
-					# Decoding ladder. Each decoder predicts all three targets at
-					# once; cols slices its output back into the per-target blocks
 					hat = {d: reg[d].predict(terms['x_next' if d == 'x' else 'stm'][mk])
 						   for d in ['x', 'h']}
 
@@ -547,8 +433,5 @@ if __name__ == '__main__':
 	baselines_pipeline()
 	# prediction_error_analysis_pipeline()
 
-
-# ToDo: 
-#  - rename baseline variables to more informative names (e.g. globaldist)
 
 
