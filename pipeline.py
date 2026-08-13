@@ -23,7 +23,7 @@ import shutil
 import time
 import torch
 import scipy.stats as ss
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import RidgeCV
 
 
 # History: the GRU low-bound baseline crashed mid-training with
@@ -198,13 +198,30 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 	chunk_size = 512
 	batch_size = 512
 	max_batches_rnn = 25000
-	max_batches_ff  = 25000
 
 	base_pars = {'datapath'   : '.',
 				 'chunk_size' : chunk_size,
 				 'chromatic'  : True,
 				 'noise'      : noise,
 				 'n_hidden'   : n_hidden}
+
+	# The three memoryless one-step references are per-class logistic regressions
+	# (bachbayes.LogisticModel). They replaced feedforward nets, which are
+	# non-convex and diverged to a saturated constant output at high noise; the
+	# logistic fit is convex and never exceeds the marginal. Objective and
+	# target_as_input pick the mapping exactly as they do for the RNN
+	def logistic_ref(name, suffix, obj, target_as_input=False):
+		m = bachbayes.LogisticModel({'datapath': '.', 'chromatic': True, 'noise': noise})
+		print(f'Benchmarking ({name})...', end='')
+		if only_testing or m.trained_weights_exists(suffix):
+			m.load_weights(suffix)
+		else:
+			t0 = time.time()
+			m.fit(obj=obj, target_as_input=target_as_input)
+			m.save_weights(suffix)
+			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes', end='')
+		print()
+		return m.test(obj=obj, target_as_input=target_as_input)
 
 	def fit_or_load(m, suffix, n_batches, **train_kwargs):
 		if only_testing or m.trained_weights_exists(suffix):
@@ -216,47 +233,26 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
 
-	# Observations high-bound -> NN one-step
-	pars = {'mod_type': 'feedforward', 'n_layers': 3}
-	pars.update(base_pars)
-	m = bachbayes.Bachmodel(pars)
+	# Observations high bound: memoryless logistic decoder (x_t -> y_t)
+	obs_high = logistic_ref('observations high bound', '_observation-high', obj=['obs'])
 
-	print('Benchmarking (observations high bound)...', end='')
-	fit_or_load(m, '_observation-high', max_batches_ff, obj=['obs'])
-	obs_high = m.test(obj=['obs'])
-
-
-	# Predictions high-bound: global distribution
+	# Predictions high bound: global distribution (marginal predictor). The net is
+	# never used - test_globaldist_model reads only the corpus - but Bachmodel is
+	# where that estimator lives, so a minimal instance carries it
 	print('Benchmarking (predictions high bound)...', end='')
-	pred_high = m.test_globaldist_model()
+	gd = bachbayes.Bachmodel({'mod_type': 'feedforward', 'n_layers': 1, **base_pars})
+	pred_high = gd.test_globaldist_model()
+	print()
+	del gd; torch.cuda.empty_cache()
 
+	# Predictions Markov high bound: logistic 1-step from noisy input (x_t -> y_{t+1})
+	pred_markh = logistic_ref('predictions markov high bound', '_prediction-markov-high', obj=['pred'])
 
-	# Predictions markov high bound: 1-back predictions
-	# Release the previous model's GPU blocks before building the next so the
-	# arena does not fragment across the five models (see preamble note)
-	del m; torch.cuda.empty_cache()
-	pars = {'mod_type': 'feedforward', 'n_layers': 1}
-	pars.update(base_pars)
-	m = bachbayes.Bachmodel(pars)
+	# Predictions Markov low bound: logistic 1-step from clean input (y_t -> y_{t+1})
+	pred_markl = logistic_ref('predictions markov low bound', '_prediction-markov-low',
+							  obj=['pred'], target_as_input=True)
 
-	print('\nBenchmarking (predictions markov bound)...', end='')
-	fit_or_load(m, '_prediction-markov-high', max_batches_ff, obj=['pred'])
-	pred_markh = m.test(obj=['pred'])
-
-
-	# Predictions markov low bound: 1-back predictions with ground-truth state
-	del m; torch.cuda.empty_cache()
-	pars = {'mod_type': 'feedforward', 'n_layers': 1}
-	pars.update(base_pars)
-	m = bachbayes.Bachmodel(pars)
-
-	print('Benchmarking (predictions markov low bound)...', end='')
-	fit_or_load(m, '_prediction-markov-low', max_batches_ff, obj=['pred'], target_as_input=True)
-	pred_markl = m.test(obj=['pred'], target_as_input=True)
-
-
-	# Predictions low bound
-	del m; torch.cuda.empty_cache()
+	# Predictions low bound: prediction-trained GRU
 	pars = {'mod_type': 'gru', 'n_layers': 1}
 	pars.update(base_pars)
 	m = bachbayes.Bachmodel(pars)
@@ -264,9 +260,8 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 	print('Benchmarking (predictions low bound)...', end='')
 	fit_or_load(m, '_prediction-low', max_batches_rnn, obj=['pred'])
 	pred_low = m.test(obj=['pred'])
+	del m; torch.cuda.empty_cache()
 
-
-	# ToDo: Use linear regression instead of 1-layer ANNs for the Markov models
 
 	# Reporting
 	performance  = {'obs_high':   obs_high,
@@ -397,108 +392,145 @@ def save_to_results(this_noise=None, this_n_hidden=None, this_run=None, results_
 		pickle.dump(savedict, f)
 
 
-def prediction_error_analysis_pipeline(run_n=0):
+# Decoding targets of the prediction-error analysis (see compute_pe_terms):
+# 'raw' is the network-visible innovation, 'sig' its signal component and 'neg'
+# the expected-but-absent (omission) component
+PE_TARGETS  = ['raw', 'sig', 'neg']
 
-	operas   = sorted(bachbayes.Chunker('./test', 1, None, True, 0, seed=bachbayes.EVAL_SEED).song_pool)
-	savedict = load_results()
+# The control ladder: a constant decoder ('b'), a decoder from the current
+# observation alone ('x'), and a decoder from the hidden state ('h'). Encoding of
+# prediction errors beyond input drive requires state > input-only, since the
+# state necessarily carries the observation it has just consumed
+PE_DECODERS = ['b', 'x', 'h']
+
+
+def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/pe_results.pickle'):
+
+	savedict      = load_results()
 	noise_vals    = savedict['noise']
 	n_hidden_vals = savedict['n_hidden']
+	operas        = sorted(bachbayes.Chunker('./test', 1, None, True, 0, seed=bachbayes.EVAL_SEED).song_pool)
 
-	results = {'pe_stm': np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
-			   'pe_std': np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
-			   #'en_m':   np.full((len(noise_vals), len(n_hidden_vals), len(operas), max(n_hidden_vals)), np.nan),
-			   #'en_d':   np.full((len(noise_vals), len(n_hidden_vals), len(operas), max(n_hidden_vals)), np.nan),
-			   'dec_m':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
-			   'dec_d':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
-			   'dec_b':  np.full((len(noise_vals), len(n_hidden_vals), len(operas)), np.nan),
-			   'noise': noise_vals, 'n_hidden': n_hidden_vals}
+	# Per-composition metrics, all (noise, n_hidden, run, opera): the correlation
+	# between innovation magnitude and state-update magnitude, plus the decoding
+	# MSE for every target x decoder pair of the ladder
+	metric_names = ['pe_std'] + [f'dec_{t}_{d}' for t in PE_TARGETS for d in PE_DECODERS]
+	shape        = (len(noise_vals), len(n_hidden_vals), n_runs, len(operas))
+
+	# Resume from an existing pickle if it matches the design; completed cells are
+	# skipped, so the sweep can be interrupted and relaunched
+	if os.path.exists(pe_path):
+		with open(pe_path, 'rb') as f:
+			results = pickle.load(f)
+		if results.get('noise') != noise_vals or results['pe_std'].shape != shape:
+			raise ValueError(f'{pe_path} was produced under a different design; archive it first')
+	else:
+		results = {name: np.full(shape, np.nan) for name in metric_names}
+		results.update({'noise': noise_vals, 'n_hidden': n_hidden_vals, 'n_runs': n_runs})
 
 	for six, noise in enumerate(noise_vals):
+
+		# The corpora and their frozen noise realisations depend on the noise level
+		# only, so the chunkers are shared across network sizes and runs
+		val_chunker  = bachbayes.Chunker('./validation', 1, None, True, noise, seed=bachbayes.EVAL_SEED)
+		test_chunker = bachbayes.Chunker('./test',       1, None, True, noise, seed=bachbayes.EVAL_SEED)
+
 		for nix, n_hidden in enumerate(n_hidden_vals):
+			for run_n in range(n_runs):
 
-			t0 = time.time()
-			print(f'Computing PE for (noise={noise:.1f}, n={n_hidden})...', end='')
+				if np.isfinite(results['dec_sig_h'][six, nix, run_n]).any():
+					continue
 
+				t0 = time.time()
+				print(f'Computing PE for (noise={noise:g}, n={n_hidden}, run {run_n})...', end='')
 
-			# A. Load model
-			pars = {'datapath'   : '.',
-					'chromatic'  : True,
-					'noise'      : noise,
-					'n_layers'   : 1,
-					'n_hidden'   : n_hidden,
-					'mod_type'   : 'gru'}
+				# A. Load the denoising-trained network with its prediction probe
+				pars = {'datapath': '.', 'chromatic': True, 'noise': noise,
+						'n_layers': 1, 'n_hidden': n_hidden, 'mod_type': 'gru'}
 
-			m = bachbayes.Bachmodel(pars)
-			m.load_weights(f'_prediction_run{run_n:02d}')
+				m = bachbayes.Bachmodel(pars)
+				try:
+					m.load_weights(f'_prediction_run{run_n:02d}')
+				except FileNotFoundError:
+					print(' weights missing; skipping')
+					continue
 
+				# B. Fit the decoders on the validation split (silence masked). The
+				# training corpus shaped the network's weights, and 70 works are
+				# ample for a linear map, so the fit stays out of both the training
+				# and the test data
+				feats = {'x': [], 'h': []}
+				targs = {t: [] for t in PE_TARGETS}
 
-			# B. Train stats to pe linear regression models
-			tr_chunker = bachbayes.Chunker(m.train_path, 1, None, m.chromatic, m.noise, m.dev, seed=bachbayes.EVAL_SEED)
+				for opera in sorted(val_chunker.song_pool):
+					song  = val_chunker.read_song_as_tensor(opera)
+					terms = m.compute_pe_terms(song['sample'], song['target'])
+					mk    = terms['mask']
+					feats['x'].append(terms['x_next'][mk])
+					feats['h'].append(terms['stm'][mk])
+					for t in PE_TARGETS:
+						targs[t].append(terms[f'pe_{t}'][mk])
 
-			pe_train, stm_train, std_train = [], [], [] 
+				feats = {k: np.concatenate(v) for k, v in feats.items()}
+				targs = {k: np.concatenate(v) for k, v in targs.items()}
 
-			for opera in tr_chunker.song_pool:
+				# Ridge, not ordinary least squares: hidden states are strongly
+				# collinear (condition number ~1e8 at 256 units), and the OLS
+				# solution then carries huge cancelling coefficients that fit the
+				# fitting split and diverge on the test set - one 256-unit run
+				# reached a test MSE of 4.0 against a constant-decoder baseline of
+				# 0.1. The penalty is chosen by leave-one-out CV over a log grid,
+				# independently per output dimension, and the same estimator is
+				# used for the input-only control so that neither side of the
+				# comparison is favoured.
+				#
+				# The three targets share a design matrix, so they are stacked into
+				# one multi-output fit per decoder: the expensive decomposition is
+				# then done once instead of three times
+				width    = targs[PE_TARGETS[0]].shape[1]
+				stacked  = np.hstack([targs[t] for t in PE_TARGETS])
+				reg      = {d: RidgeCV(alphas=np.logspace(-3, 3, 7), alpha_per_target=True)
+							   .fit(feats[d], stacked)
+							for d in ['x', 'h']}
+				cols     = {t: slice(k * width, (k + 1) * width)
+							for k, t in enumerate(PE_TARGETS)}
+				constant = {t: targs[t].mean(0) for t in PE_TARGETS}
 
-				sample = tr_chunker.read_song_as_tensor(opera)['sample']
-				pe, stm, std = m.compute_pe_and_state(sample)
+				# C. Evaluate on the test set, one value per composition
+				for nop, opera in enumerate(operas):
 
-				pe_train.append(pe)
-				stm_train.append(stm)
-				std_train.append(std)
+					song  = test_chunker.read_song_as_tensor(opera)
+					terms = m.compute_pe_terms(song['sample'], song['target'])
+					mk    = terms['mask']
+					if mk.sum() < 10:
+						continue
 
-			pe_train  = np.concatenate(pe_train, axis=0)
-			stm_train = np.concatenate(stm_train, axis=0)
-			std_train = np.concatenate(std_train, axis=0)
+					# Innovation-driven updating: the magnitude of the visible
+					# innovation against the magnitude of the state update - the
+					# hallmark of Kalman-style filtering
+					pe2  = (terms['pe_raw'][mk] ** 2).mean(1)
+					std2 = (terms['std'][mk] ** 2).mean(1)
+					results['pe_std'][six, nix, run_n, nop] = ss.pearsonr(pe2, std2)[0]
 
-			reg_m = LinearRegression().fit(stm_train, pe_train)
-			reg_d = LinearRegression().fit(std_train, pe_train)
+					# Decoding ladder. Each decoder predicts all three targets at
+					# once; cols slices its output back into the per-target blocks
+					hat = {d: reg[d].predict(terms['x_next' if d == 'x' else 'stm'][mk])
+						   for d in ['x', 'h']}
 
+					for t in PE_TARGETS:
+						truth = terms[f'pe_{t}'][mk]
+						preds = {'b': constant[t],
+								 'x': hat['x'][:, cols[t]],
+								 'h': hat['h'][:, cols[t]]}
+						for d in PE_DECODERS:
+							results[f'dec_{t}_{d}'][six, nix, run_n, nop] = \
+								((truth - preds[d]) ** 2).mean()
 
-			# C. Compute PE and stats in the test set
-			chunker = bachbayes.Chunker(m.test_path, 1, None, m.chromatic, m.noise, m.dev, seed=bachbayes.EVAL_SEED)
-			operas  = sorted(chunker.song_pool)
+				# Incremental save: a completed cell survives an interruption
+				with open(pe_path, 'wb') as f:
+					pickle.dump(results, f)
 
-			for nop, opera in enumerate(operas):
-
-				# 0. Computing prediction error and network's states
-				sample = chunker.read_song_as_tensor(opera)['sample']
-				pe, stm, std = m.compute_pe_and_state(sample)
-
-
-				# 1. Total prediction error with network activity
-				pe2  = (pe ** 2).mean(1)
-				stm2 = (stm ** 2).mean(1) 
-				std2 = (std ** 2).mean(1) 
-
-				results['pe_stm'][six, nix, nop] = ss.pearsonr(pe2, stm2)[0]
-				results['pe_std'][six, nix, nop] = ss.pearsonr(pe2, std2)[0]
-
-				"""
-				# 2. Prediction error encoding per neuron
-				for n in range(n_hidden):
-					stm2 = stm[..., n] ** 2
-					std2 = std[..., n] ** 2
-					results['en_m'][six, nix, nop, n] = ss.pearsonr(pe2, stm2)[0]
-					results['en_d'][six, nix, nop, n] = ss.pearsonr(pe2, std2)[0]
-				"""
-
-				# 3. Prediction error decoding accuracy
-				pe_hat_m = reg_m.predict(stm)
-				pe_hat_d = reg_d.predict(std)
-				pe_hat_b = pe_train.mean(0)
-
-				results['dec_m'][six, nix, nop] = ((pe - pe_hat_m)**2).mean()
-				results['dec_d'][six, nix, nop] = ((pe - pe_hat_d)**2).mean()
-				results['dec_b'][six, nix, nop] = ((pe - pe_hat_b)**2).mean()
-
-
-			with open('./results/pe_results.pickle', 'wb') as f:
-				pickle.dump(results, f)
-
-			print(f' done! Time = {(time.time()-t0)/60:.2f}m')
-
-
-	# ToDo: Enconding of PE+/- --> (np.maximum(-pe,  0)**2).mean(1)
+				print(f' done! Time = {(time.time()-t0)/60:.2f}m')
 
 
 def load_results(results_path='./results/results.pickle'):

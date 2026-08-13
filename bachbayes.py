@@ -5,6 +5,7 @@ import glob
 import io
 import mido
 import os
+import pickle
 import re
 import requests
 import time
@@ -13,6 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 import zipfile
 from bs4 import BeautifulSoup
+from sklearn.linear_model import LogisticRegression
 from urllib.parse import urljoin, urlparse, parse_qs
 
 
@@ -331,6 +333,50 @@ class Bachmodel():
 
 		return pe, stm, std
 
+	def compute_pe_terms(self, sample, target):
+		"""Per-timestep quantities for the prediction-error analyses.
+
+		Every series is aligned on the predicted frame: index i refers to frame
+		t+1 = i+1, predicted from the state after frame t = i. Returned keys:
+
+		  pe_raw  x_{t+1} - p_t: the network-visible innovation; its magnitude
+		          scales with the noise parameter
+		  pe_sig  y_{t+1} - p_t: the signal innovation. The raw error also
+		          contains the observation noise, which the state trivially
+		          carries because it has just consumed x_{t+1}; the signal part
+		          is the component whose encoding is informative
+		  pe_neg  max(p_t - y_{t+1}, 0): the expected-but-absent component
+		          (omissions). At an omission the input holds no trace of the
+		          error, so this part cannot be reconstructed from the current
+		          observation alone - the model analogue of omission responses
+		  x_next  x_{t+1}, the features of the input-only control decoder
+		  stm     h_{t+1}; std  h_{t+1} - h_t
+		  mask    frames where y_{t+1} contains any active pitch class. False
+		          on the silence padding inserted between concatenated
+		          movements, which otherwise couples all series spuriously
+		"""
+		with torch.no_grad():
+
+			obs, pred, hidden = self.net(sample)
+			if hidden is None:
+				raise ValueError('compute_pe_terms requires a recurrent model (FeedForwardNN has no hidden state)')
+			pred   = pred.cpu().detach().numpy()
+			hidden = hidden.cpu().detach().numpy()
+			sample = sample.cpu().detach().numpy()
+			target = target.cpu().detach().numpy()
+
+		p      = pred[0, :-1]
+		x_next = sample[0, 1:]
+		y_next = target[0, 1:]
+
+		return {'pe_raw': x_next - p,
+				'pe_sig': y_next - p,
+				'pe_neg': np.maximum(p - y_next, 0),
+				'x_next': x_next,
+				'stm'   : hidden[0, 1:],
+				'std'   : hidden[0, 1:] - hidden[0, :-1],
+				'mask'  : y_next.sum(1) > 0}
+
 	def test_globaldist_model(self):
 		
 		with torch.no_grad():
@@ -385,6 +431,153 @@ class Bachmodel():
 		filepath = os.path.join(folder, name + suffix + '.' + extension)
 
 		return filepath
+
+
+# Reference model
+class LogisticModel():
+	"""Per-class logistic-regression reference: a memoryless one-step decoder or
+	predictor. Each of the n_dim output classes is an independent logistic
+	regression on the whole input vector at a single time step, so the model has
+	no memory and no hidden layer. It replaces the feedforward reference nets
+	(the memoryless decoder and the two first-order Markov models), which are
+	non-convex and diverged to a saturated constant output at high noise. The
+	logistic fit is convex, so it converges reliably and can never do worse than
+	the marginal predictor - the correct behaviour for a memoryless bound.
+
+	Which quantity it estimates is set, exactly as for Bachmodel, by ``obj`` and
+	``target_as_input``:
+	  obj=['obs']                      x_t   -> y_t       (memoryless decoder)
+	  obj=['pred']                     x_t   -> y_{t+1}   (Markov, noisy input)
+	  obj=['pred'], target_as_input    y_t   -> y_{t+1}   (Markov, clean input)
+
+	The public interface mirrors the parts of Bachmodel that pipeline.baselines()
+	uses (fit/test/save_weights/load_weights/trained_weights_exists), so the
+	driver treats it like any other model."""
+
+	def __init__(self, pars, dev=None):
+
+		self.pars      = pars
+		self.chromatic = pars['chromatic']
+		self.noise     = pars['noise']
+		self.datapath  = pars['datapath']
+		self.train_path = os.path.join(pars['datapath'], 'training')
+		self.test_path  = os.path.join(pars['datapath'], 'test')
+
+		self.n_dim = 12 if self.chromatic else 108
+
+		# No hidden units or layers to name; the noise level and encoding fully
+		# identify the model, mirroring Bachmodel.modname minus the net geometry
+		modname = 'logistic'
+		modname += f'{"_chromatic" if self.chromatic else ""}'
+		modname += f'_noise{self.noise}'.replace('.', 'p')
+		self.modname = modname
+		self.modpath = f'./models/{modname}.pkl'
+
+		# Fitted parameters: a weight matrix (n_out x n_in), a bias, and a constant
+		# fallback probability for any class that never varied in the training set
+		self.weight   = None
+		self.bias     = None
+		self.constant = None
+
+	def fit(self, obj=['obs'], target_as_input=False, seed=EVAL_SEED):
+
+		chunker = Chunker(self.train_path, 1, None, self.chromatic, self.noise,
+						  torch.device('cpu'), seed=seed)
+
+		X, Y = self._gather_(chunker, obj, target_as_input)
+
+		self.weight   = np.zeros((self.n_dim, self.n_dim))
+		self.bias     = np.zeros(self.n_dim)
+		self.constant = np.full(self.n_dim, np.nan)
+
+		for k in range(self.n_dim):
+			col = Y[:, k]
+			if col.min() == col.max():
+				# Class never turned on (or never off) in training: no boundary to
+				# fit, so fall back to its clamped frequency
+				self.constant[k] = np.clip(col.mean(), 1e-6, 1 - 1e-6)
+				continue
+			# C large ~ maximum-likelihood (negligible regularisation), matching an
+			# unpenalised logistic fit
+			lr = LogisticRegression(C=1e6, max_iter=1000)
+			lr.fit(X, col)
+			self.weight[k] = lr.coef_[0]
+			self.bias[k]   = lr.intercept_[0]
+
+	def predict(self, X):
+
+		logits = X @ self.weight.T + self.bias
+		probs  = 1.0 / (1.0 + np.exp(-logits))
+
+		# Overwrite the classes that were constant in training
+		const = ~np.isnan(self.constant)
+		if const.any():
+			probs[:, const] = self.constant[const]
+
+		return np.clip(probs, 1e-6, 1 - 1e-6)
+
+	def test(self, obj=['obs'], target_as_input=False, test_path=None):
+
+		if test_path is None:
+			test_path = self.test_path
+
+		chunker = Chunker(test_path, 1, None, self.chromatic, self.noise,
+						  torch.device('cpu'), seed=EVAL_SEED)
+		operas  = sorted(chunker.song_pool)
+
+		performance = np.zeros(len(operas))
+
+		for n, opera in enumerate(operas):
+			X, Y = self._gather_(chunker, obj, target_as_input, operas=[opera])
+			P = self.predict(X)
+			# Mean binary cross-entropy over notes and time, matching nn.BCELoss
+			performance[n] = -(Y * np.log(P) + (1 - Y) * np.log(1 - P)).mean()
+
+		return performance
+
+	def save_weights(self, suffix=''):
+
+		with open(self._compose_weightpath_(suffix), 'wb') as f:
+			pickle.dump({'weight': self.weight, 'bias': self.bias,
+						 'constant': self.constant}, f)
+
+	def load_weights(self, suffix=''):
+
+		with open(self._compose_weightpath_(suffix), 'rb') as f:
+			state = pickle.load(f)
+		self.weight, self.bias, self.constant = state['weight'], state['bias'], state['constant']
+
+	def trained_weights_exists(self, suffix=''):
+
+		return os.path.exists(self._compose_weightpath_(suffix))
+
+	def _gather_(self, chunker, obj, target_as_input, operas=None):
+
+		# Flatten whole songs into (timestep, n_dim) input/target rows. The input
+		# is the clean chord when target_as_input else the noisy observation; the
+		# target is shifted by one step for the prediction objective
+		if operas is None:
+			operas = sorted(chunker.song_pool)
+
+		Xs, Ys = [], []
+		for opera in operas:
+			song   = chunker.read_song_as_tensor(opera)
+			target = song['target'][0].cpu().numpy()
+			source = target if target_as_input else song['sample'][0].cpu().numpy()
+
+			if 'pred' in obj:
+				Xs.append(source[:-1]); Ys.append(target[1:])
+			else:
+				Xs.append(source);      Ys.append(target)
+
+		return np.concatenate(Xs), np.concatenate(Ys)
+
+	def _compose_weightpath_(self, suffix):
+
+		folder, fname   = os.path.split(self.modpath)
+		name, extension = '.'.join(fname.split('.')[:-1]), fname.split('.')[-1]
+
+		return os.path.join(folder, name + suffix + '.' + extension)
 
 
 # Data Loading
