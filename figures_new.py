@@ -17,16 +17,21 @@ then across the noise x network-size sweep:
   S3     the prediction effect replicates across the five runs
   S4     PE encoding replicates across the five runs
 
-Most of these cannot be drawn yet: the sweep is one noise level deep, no reference
-models have been trained, and the prediction-error analysis has never been run.
-Those functions carry their availability guard and panel plan but an empty body;
-they announce what they are waiting for instead of failing.
+The prediction-error figures (4, 5, S4) read results/pe_results.pickle, written by
+pipeline.prediction_error_analysis_pipeline(). Their design answers the input-drive
+confound: the state necessarily encodes the observation it has just consumed, so PE
+encoding is only claimed where a state decoder beats an input-only control - most
+stringently for the omission component, which the current input cannot carry.
+
+Every figure guards on what it needs and plots only what is present, so the module
+stays runnable while any analysis output is missing.
 
 All figures are laid out to PLOS Computational Biology specifications: full column
 width (7.5 in), Arial at 8-10 pt, and fonts embedded as TrueType.
 """
 
 import glob
+import logging
 import os
 import pickle
 import re
@@ -34,9 +39,20 @@ import re
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import scipy.stats as ss
+import seaborn as sns
 
+import bachbayes
 import pipeline
+
+
+# Custom mathtext fontsets (Arial for $x_t$ etc.) make font_manager log a benign
+# "Failed to find font weight normal" on every call. The glyphs still embed as
+# Arial Italic - verified in the output PDFs - so the message is pure noise. Filter
+# that one string only, leaving genuine missing-font warnings visible
+logging.getLogger('matplotlib.font_manager').addFilter(
+	lambda record: 'font weight normal' not in record.getMessage())
 
 
 # PLOS figure specification. Full-width figures are 7.5 in (2250 px at 300 dpi);
@@ -52,8 +68,12 @@ RESULTS_DIR = './results'
 PE_RESULTS  = './results/pe_results.pickle'
 
 # The cell shown by every single-network figure. Kept here rather than passed as
-# arguments so that all example panels are guaranteed to describe the same network
-EXAMPLE_NOISE   = 0.001
+# arguments so that all example panels are guaranteed to describe the same network.
+# sigma sits just inside the regime where prediction emerges (the RNN starts
+# beating Markov-high around sigma = 0.15) while decoding is still largely intact -
+# neither effect is visible at the near-noiseless control, where the RNN barely
+# edges Markov-high and the piano rolls look clean
+EXAMPLE_NOISE   = 0.2
 EXAMPLE_NHIDDEN = 64
 EXAMPLE_RUN     = 0
 EXAMPLE_OPERA   = 14
@@ -83,11 +103,30 @@ MODEL_LABELS = {
 	'pred_high' : 'global distribution',
 }
 
-# Reference ladder for prediction, ordered by the error each model is expected to
-# reach (methods.tex Eq 5). The probed RNN sits in the middle: beating Markov-high
-# is the claim, and whether it also beats Markov-low is the open question
+# Models shown alongside the probed RNN on the prediction task, in a FIXED order
+# set by theory, not by the observed error - _ladder_violins_ draws them left to
+# right as listed. The probed RNN is deliberately flanked by its two matched
+# first-order bounds: Markov-low (clean current state, a lower bound on error) on
+# its left and Markov-high (same noisy channel as the RNN, the upper bound it must
+# beat) on its right. The outer pair frames the scale: the prediction-trained GRU
+# is the empirical ceiling (best the architecture reaches when trained to predict)
+# and the global distribution the trivial floor (methods.tex Eq 5). The headline
+# claim is RNN < Markov-high: both see the noisy channel, so the gap is emergent
+# prediction. pred_low crosses the Markov models with noise (full history vs a
+# clean-input one-step oracle), so this order is a theoretical scale, not a
+# guarantee of monotone medians at every cell
 PREDICTION_LADDER = ['pred_low', 'pred_markl', 'pred_err', 'pred_markh', 'pred_high']
+PREDICTION_KEY    = ('pred_err', 'pred_markh')   # the headline comparison
 DECODING_LADDER   = ['obs_err', 'obs_high']
+
+# Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
+# dec_<target>_<decoder>, with targets raw (x_{t+1} - p_t), sig (y_{t+1} - p_t)
+# and neg (the expected-but-absent omission component), and the control ladder
+# b (constant) / x (input-only) / h (hidden state). Encoding beyond input drive
+# requires h to beat x, since the state necessarily carries the observation it
+# has just consumed
+PE_DECODING_KEYS  = [f'dec_{t}_{d}' for t in ('raw', 'sig', 'neg') for d in ('b', 'x', 'h')]
+PE_DECODER_LABELS = {'b': 'constant', 'x': 'input only', 'h': 'hidden state'}
 
 
 # Main figures
@@ -105,6 +144,8 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 	savedict = _load_results_()
 	if not _require_(savedict, DECODING_LADDER, 'results.pickle'):
 		return
+
+	six, nix = _example_indices_(savedict)
 
 	ex  = _load_example_model_()
 	sl  = slice(0, EXAMPLE_LENGTH)
@@ -138,9 +179,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 
 	# D - decoding error over the 140 test compositions, RNN versus ANN
 	axD  = fig.add_subplot(gs[1, 1])
-	pos  = _ladder_violins_(axD, savedict, DECODING_LADDER, 0,
-							pipeline.N_HIDDEN_VALS.index(EXAMPLE_NHIDDEN),
-							run=EXAMPLE_RUN)
+	pos  = _ladder_violins_(axD, savedict, DECODING_LADDER, six, nix, run=EXAMPLE_RUN)
 	cols = {k: pos[k][1] for k in pos}
 	ymax = max(np.max(v) for v in cols.values())
 
@@ -172,7 +211,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	if not _require_(savedict, PREDICTION_LADDER, 'results.pickle'):
 		return
 
-	nix = pipeline.N_HIDDEN_VALS.index(EXAMPLE_NHIDDEN)
+	six, nix = _example_indices_(savedict)
 
 	ex     = _load_example_model_()
 	sl     = slice(0, EXAMPLE_LENGTH)
@@ -197,7 +236,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 
 	# B - the reference ladder over the 140 test compositions
 	axB  = fig.add_subplot(gs[1, 0])
-	pos  = _ladder_violins_(axB, savedict, PREDICTION_LADDER, 0, nix, run=EXAMPLE_RUN,
+	pos  = _ladder_violins_(axB, savedict, PREDICTION_LADDER, six, nix, run=EXAMPLE_RUN,
 							ref_colors=ref_colors)
 	cols = {k: pos[k][1] for k in pos}
 	ymin = min(np.min(v) for v in cols.values())
@@ -216,8 +255,8 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 
 	# C - per-composition scatter of RNN against the same three references
 	axC  = fig.add_subplot(gs[1, 1])
-	rnn  = _get_cell_(savedict, 'pred_err', 0, nix, run=EXAMPLE_RUN)
-	refs = {key: _get_cell_(savedict, key, 0, nix) for key in contrasts}
+	rnn  = _get_cell_(savedict, 'pred_err', six, nix, run=EXAMPLE_RUN)
+	refs = {key: _get_cell_(savedict, key, six, nix) for key in contrasts}
 	_reference_scatter_(axC, rnn, refs, contrasts, ref_colors, legend=True)
 	axC.set_xlabel(MODEL_LABELS['pred_err'].replace('\n', ' ') + ' error',
 				   fontsize=LABEL_SIZE)
@@ -232,7 +271,7 @@ def fig03_prediction_sweep(fname='fig03_prediction-sweep.pdf'):
 
 	A  error against noise amplitude at the exemplar network size, one line per
 	   ladder model - shows how the gap opens as the channel degrades
-	B  heatmap of Cohen's d, RNN versus Markov-high, over the 9 x 6 design
+	B  heatmap of Cohen's d, RNN versus Markov-high, over the sweep
 	C  heatmap of the same contrast in raw BCE units
 	"""
 	_set_plos_style_()
@@ -241,44 +280,184 @@ def fig03_prediction_sweep(fname='fig03_prediction-sweep.pdf'):
 	if not _require_(savedict, PREDICTION_LADDER, 'results.pickle'):
 		return
 
-	print('  data present; panels not implemented yet')
+	noise, n_hidden = savedict['noise'], savedict['n_hidden']
+	nix = n_hidden.index(EXAMPLE_NHIDDEN)
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
+	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
+						   hspace=0.5, height_ratios=[1.1, 1, 1])
+
+	# A - error vs noise at the exemplar size, one line per model. Noise is the
+	# x axis here, so colour is free to carry model identity (accent for the RNN,
+	# reference categorical colours). Error bars are +/- SEM across the 140 test
+	# compositions, after averaging each composition over the five runs - the
+	# spread of the corpus, not a between-network estimate
+	axA = fig.add_subplot(gs[0])
+	ref_colors = _reference_colors_()
+	xs = np.arange(len(noise))
+
+	for key in PREDICTION_LADDER:
+		is_rnn = key == 'pred_err'
+		colour = _model_colors_()['pred_err'] if is_rnn else ref_colors[key]
+		means, sems = _mean_sem_vs_noise_(savedict, key, nix)
+		axA.errorbar(xs, means, yerr=sems, color=colour,
+					 linewidth=1.3 if is_rnn else 1.0, marker='o', markersize=2.5,
+					 elinewidth=0.7, capsize=1.5, zorder=3 if is_rnn else 2,
+					 label=MODEL_LABELS[key].replace('\n', ' '))
+
+	axA.set_xticks(xs)
+	axA.set_xticklabels([f'{n:g}' for n in noise], fontsize=FONT_SIZE - 1)
+	axA.set_xlabel('noise amplitude (σ)', fontsize=LABEL_SIZE)
+	axA.set_ylabel('prediction error (BCE)', fontsize=LABEL_SIZE)
+	axA.set_title(f'n = {EXAMPLE_NHIDDEN} hidden units', fontsize=FONT_SIZE, pad=2)
+	axA.legend(fontsize=FONT_SIZE - 2, frameon=False, loc='lower right', ncol=2,
+			   handlelength=1.4, columnspacing=1.0, labelspacing=0.3)
+	_panel_label_(axA, 'A')
+
+	# B - Cohen's d of the headline contrast (Markov-high - RNN); warm = RNN wins
+	axB = fig.add_subplot(gs[1])
+	vals, annot = _sweep_maps_(savedict, 'pred_markh', 'pred_err', plot_cohen=True)
+	_heatmap_(axB, vals, annot, vmax=1.5, noise_vals=noise, n_hidden_vals=n_hidden,
+			  cbar_label="Cohen's d")
+	axB.set_title('emergent prediction: RNN vs Markov-high (noisy input)',
+				  fontsize=FONT_SIZE, pad=3)
+	_panel_label_(axB, 'B')
+
+	# C - the same contrast in raw BCE units
+	axC = fig.add_subplot(gs[2])
+	vals, annot = _sweep_maps_(savedict, 'pred_markh', 'pred_err', plot_cohen=False)
+	_heatmap_(axC, vals, annot, vmax=0.07, noise_vals=noise, n_hidden_vals=n_hidden,
+			  cbar_label='Δ BCE')
+	_panel_label_(axC, 'C')
+
+	_save_(fig, fname)
 
 
 def fig04_pe_one_net(fname='fig04_pe-one-net.pdf'):
-	"""Prediction errors are encoded, in a single network.
+	"""Prediction errors drive and inhabit the state, in a single network.
 
-	A  z-scored timecourses of the population prediction error, the state energy
-	   and the state-change energy for one test composition
-	B  regression of squared prediction error on state energy
-	C  the same against state-change energy
-	D  prediction-error decoding MSE over the 140 compositions: states versus
-	   derivatives versus the mean-vector baseline decoder
+	A  z-scored timecourses of the innovation magnitude and the state-update
+	   magnitude for one test composition (silence-padding frames blanked)
+	B  per-timestep scatter of the two, with the correlation - the
+	   innovation-driven-updating signature of Kalman-style filtering
+	C  decoding the signal innovation y_{t+1} - p_t over the 140 compositions:
+	   constant vs input-only vs hidden-state decoder. The input-only rung is the
+	   critical control: the state necessarily carries the observation it has just
+	   consumed, so only state > input demonstrates encoding beyond input drive
+	D  the same ladder for the expected-but-absent (omission) component, where the
+	   current input holds no trace of the error by construction
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_stm', 'pe_std', 'dec_m', 'dec_d', 'dec_b'],
-					 'pe_results.pickle'):
+	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
 		return
 
-	print('  data present; panels not implemented yet')
+	six, nix = _example_indices_(pe_dict)
+
+	# Example-network series, computed on the fly (mirrors compute_pe_terms)
+	ex   = _load_example_model_()
+	pe2  = ((ex['sample'][1:] - ex['pred'][:-1]) ** 2).mean(1)
+	std2 = ((ex['hidden'][1:] - ex['hidden'][:-1]) ** 2).mean(1)
+	mask = ex['target'][1:].sum(1) > 0
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 5.2))
+	gs  = fig.add_gridspec(2, 6, left=0.08, right=0.985, bottom=0.10, top=0.94,
+						   wspace=1.1, hspace=0.45, height_ratios=[0.8, 1])
+
+	# A - the two magnitude timecourses, z-scored over sounding frames; silence
+	# pads between concatenated movements are blanked rather than hidden, so the
+	# gaps mark the movement boundaries
+	axA = fig.add_subplot(gs[0, :4])
+	accent = _model_colors_()['pred_err']
+	for series, colour, label in [(pe2, '0.3', 'innovation $||e_t||^2$'),
+								  (std2, accent, 'state update $||\\Delta h_t||^2$')]:
+		z = np.full_like(series, np.nan)
+		z[mask] = (series[mask] - series[mask].mean()) / series[mask].std()
+		axA.plot(z, linewidth=0.6, color=colour, label=label)
+	axA.set_xlim(0, len(pe2))
+	axA.set_xlabel('time step', fontsize=LABEL_SIZE)
+	axA.set_ylabel('z-score', fontsize=LABEL_SIZE)
+	axA.set_title(f'{ex["opera"].upper()} (test set)', fontsize=FONT_SIZE, pad=2)
+	axA.legend(fontsize=FONT_SIZE - 1, frameon=False, loc='upper right', ncol=2,
+			   handlelength=1.2, columnspacing=1.0)
+	_panel_label_(axA, 'A')
+
+	# B - the same two series against each other, one dot per (sounding) step
+	axB = fig.add_subplot(gs[0, 4:])
+	r, p = ss.pearsonr(pe2[mask], std2[mask])
+	axB.scatter(pe2[mask], std2[mask], s=3, color=accent, alpha=0.4, edgecolor='none')
+	axB.set_xlabel('innovation $||e_t||^2$', fontsize=LABEL_SIZE)
+	axB.set_ylabel('state update $||\\Delta h_t||^2$', fontsize=LABEL_SIZE)
+	# The per-timestep p underflows to zero for any decent correlation over
+	# hundreds of steps; report a floor rather than a meaningless exact value
+	p_str = f'p = {p:.1g}' if p > 1e-10 else 'p < 1e-10'
+	axB.set_title(f'r = {r:.2f} ({p_str})', fontsize=FONT_SIZE, pad=2)
+	_panel_label_(axB, 'B')
+
+	# C, D - decoding ladders at the exemplar cell (single network, run 0)
+	for ax, target, letter, title in [
+			(fig.add_subplot(gs[1, :3]), 'sig', 'C', 'signal innovation  $y_{t+1} - p_t$'),
+			(fig.add_subplot(gs[1, 3:]), 'neg', 'D', 'omissions  $(p_t - y_{t+1})_+$')]:
+
+		# cols holds log MSE, so the bracket reports the log-scale effect size
+		cols = _decoding_violins_(ax, pe_dict, target, six, nix, run=EXAMPLE_RUN)
+		lo   = min(np.nanmin(v) for v in cols.values())
+		hi   = max(np.nanmax(v) for v in cols.values())
+		ax.set_ylim(lo - 0.15 * (hi - lo), hi + 0.55 * (hi - lo))
+		_write_stats_pair_(ax, cols, 'x', 'h', x0=1, x1=2, y=hi + 0.12 * (hi - lo))
+		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
+		_panel_label_(ax, letter)
+
+	_save_(fig, fname)
 
 
 def fig05_pe_sweep(fname='fig05_pe-sweep.pdf'):
 	"""Prediction-error encoding across the sweep.
 
-	A  heatmap of the prediction-error / state-energy correlation, 9 x 6
-	B  heatmap of the prediction-error / state-change correlation
-	C  heatmap of Cohen's d for baseline versus state-based PE decoding
+	A  heatmap of the innovation / state-update correlation (mean per-composition
+	   r, run-averaged), the Kalman-signature panel
+	B  heatmap of the state decoder's advantage over the input-only control for
+	   the signal innovation (Cohen's d of the paired MSE difference; warm =
+	   state better)
+	C  the same for the omission component
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_stm', 'pe_std', 'dec_m', 'dec_b'],
-					 'pe_results.pickle'):
+	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
 		return
 
-	print('  data present; panels not implemented yet')
+	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
+	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
+						   hspace=0.5)
+
+	# A - innovation-driven updating across the design
+	axA = fig.add_subplot(gs[0])
+	vals, annot = _pe_corr_map_(pe_dict)
+	_heatmap_(axA, vals, annot, vmax=1.0, noise_vals=noise, n_hidden_vals=n_hidden,
+			  cbar_label='mean r')
+	axA.set_title('innovation-driven state updating: corr(||e||², ||Δh||²)',
+				  fontsize=FONT_SIZE, pad=3)
+	_panel_label_(axA, 'A')
+
+	# B, C - decoding beyond input drive: paired Cohen's d of input-only minus
+	# state MSE (positive = state better), run-averaged per composition
+	for row, target, letter, title in [
+			(1, 'sig', 'B', 'signal innovation: state decoder vs input-only'),
+			(2, 'neg', 'C', 'omissions: state decoder vs input-only')]:
+
+		ax = fig.add_subplot(gs[row])
+		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_x', f'dec_{target}_h',
+								   plot_cohen=True, log=True)
+		_heatmap_(ax, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
+				  cbar_label="Cohen's d (log MSE)")
+		ax.set_title(title, fontsize=FONT_SIZE, pad=3)
+		_panel_label_(ax, letter)
+
+	_save_(fig, fname)
 
 
 # Supplementary figures
@@ -382,8 +561,12 @@ def figS1_loss_timecourses(fname='figS1_loss-timecourses.pdf'):
 def figS2_decoding_sweep(fname='figS2_decoding-sweep.pdf'):
 	"""Decoding across the sweep.
 
-	A  heatmap of Cohen's d, RNN versus memory-less ANN, over the 9 x 6 design
-	B  the same contrast in raw BCE units
+	Heatmap of the RNN's decoding advantage over the memoryless logistic decoder
+	(reference - RNN, in raw BCE units) across the noise x network-size design.
+	The Cohen's d panel was dropped: at low noise both decoders are near-perfect,
+	so the pooled SD collapses and d inflates into an artefact that says more about
+	vanishing variance than about the effect; the raw difference is the honest,
+	interpretable quantity.
 	"""
 	_set_plos_style_()
 
@@ -391,7 +574,22 @@ def figS2_decoding_sweep(fname='figS2_decoding-sweep.pdf'):
 	if not _require_(savedict, DECODING_LADDER, 'results.pickle'):
 		return
 
-	print('  data present; panels not implemented yet')
+	noise, n_hidden = savedict['noise'], savedict['n_hidden']
+
+	# With the logistic decoder no longer diverging, the RNN's decoding advantage
+	# is real but modest (~0.09 BCE at most), growing with noise; the old ~2.2 was
+	# the feedforward baseline's saturated-output artefact, not RNN skill
+	fig = plt.figure(figsize=(FIG_WIDTH, 2.7))
+	ax  = fig.add_subplot(111)
+	fig.subplots_adjust(left=0.10, right=0.99, bottom=0.17, top=0.90)
+
+	vals, annot = _sweep_maps_(savedict, 'obs_high', 'obs_err', plot_cohen=False)
+	_heatmap_(ax, vals, annot, vmax=0.08, noise_vals=noise, n_hidden_vals=n_hidden,
+			  cbar_label='Δ BCE')
+	ax.set_title('decoding advantage: memory-less decoder $-$ RNN (BCE)',
+				 fontsize=FONT_SIZE, pad=3)
+
+	_save_(fig, fname)
 
 
 def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
@@ -414,7 +612,7 @@ def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
 	if not _require_(savedict, PREDICTION_LADDER, 'results.pickle'):
 		return
 
-	six, nix   = 0, pipeline.N_HIDDEN_VALS.index(EXAMPLE_NHIDDEN)
+	six, nix   = _example_indices_(savedict)
 	runs       = _available_runs_(savedict, 'pred_err', six, nix)[:5]
 	contrasts  = ['pred_markh', 'pred_markl', 'pred_low']
 	ref_colors = _reference_colors_()
@@ -483,26 +681,61 @@ def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
 def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	"""Prediction-error encoding replicates across the five runs.
 
-	Requires the run axis added to prediction_error_analysis_pipeline(); the
-	current pe_results.pickle layout stores a single run.
+	The composition stays the unit of analysis (n = 140); each quantity is
+	computed independently within every run at the exemplar cell.
 
-	A  per-run violins of the two correlations
-	B  forest plot of per-run d for baseline versus state-based decoding
-	C  per-run p-values with the Bonferroni threshold
+	A  per-run violins of the innovation / state-update correlation
+	B  forest of Cohen's d, input-only minus state decoding MSE (signal
+	   innovation), one row per run; right of zero = state better
+	C  the same for the omission component
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_stm', 'pe_std', 'dec_m', 'dec_b'],
-					 'pe_results.pickle'):
+	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
 		return
 
-	if pe_dict['pe_stm'].ndim < 4:
-		print('  pe_results.pickle has no run axis (see prediction_error_analysis_'
-			  'pipeline); skipping')
-		return
+	six, nix = _example_indices_(pe_dict)
+	runs     = _available_runs_(pe_dict, 'pe_std', six, nix)[:5]
+	accent   = _model_colors_()['pred_err']
 
-	print('  data present; panels not implemented yet')
+	fig, axs = plt.subplots(1, 3, figsize=(FIG_WIDTH, 2.9))
+	fig.subplots_adjust(left=0.09, right=0.99, bottom=0.18, top=0.90, wspace=0.45)
+
+	# A - the correlation, per run
+	rs = [pe_dict['pe_std'][six, nix, r] for r in runs]
+	rs = [v[np.isfinite(v)] for v in rs]
+	parts = axs[0].violinplot(rs, positions=range(len(runs)), showextrema=False,
+							  widths=0.8)
+	for body in parts['bodies']:
+		body.set_facecolor(accent)
+		body.set_edgecolor(accent)
+		body.set_alpha(0.55)
+	axs[0].axhline(0, color='0.6', linewidth=0.6, linestyle='--', zorder=0)
+	axs[0].set_xticks(range(len(runs)))
+	axs[0].set_xticklabels([f'run {r + 1}' for r in runs], fontsize=FONT_SIZE - 1)
+	axs[0].set_ylabel('corr(||e||², ||Δh||²) per composition', fontsize=LABEL_SIZE)
+	_panel_label_(axs[0], 'A')
+
+	# B, C - the decoding contrast per run: d of paired input-only minus state MSE
+	for ax, target, letter, title in [(axs[1], 'sig', 'B', 'signal innovation'),
+									  (axs[2], 'neg', 'C', 'omissions')]:
+		# Log MSE, matching Fig 5: the raw scale is heavy-tailed across
+		# compositions and understates a consistent effect (see _sweep_maps_)
+		effects, intervals = [], []
+		for r in runs:
+			x = pe_dict[f'dec_{target}_x'][six, nix, r]
+			h = pe_dict[f'dec_{target}_h'][six, nix, r]
+			ok = np.isfinite(x) & np.isfinite(h) & (x > 0) & (h > 0)
+			lx, lh = np.log(x[ok]), np.log(h[ok])
+			effects.append(_compute_stats_(lx, lh)[0])
+			intervals.append(_bootstrap_ci_(lx, lh))
+		_forest_plot_(ax, effects, intervals, [f'run {r + 1}' for r in runs])
+		ax.set_xlabel("Cohen's d (log MSE, input $-$ state)", fontsize=LABEL_SIZE)
+		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
+		_panel_label_(ax, letter)
+
+	_save_(fig, fname)
 
 
 # Style and output
@@ -588,6 +821,15 @@ def _require_(savedict, keys, source):
 		return False
 
 	return True
+
+
+def _example_indices_(savedict):
+
+	# Noise and hidden-unit indices of the exemplar cell, resolved against the
+	# stored axes so the single-network figures follow EXAMPLE_NOISE / _NHIDDEN
+	# rather than a hardcoded position that silently points at the wrong cell when
+	# the exemplar changes
+	return savedict['noise'].index(EXAMPLE_NOISE), savedict['n_hidden'].index(EXAMPLE_NHIDDEN)
 
 
 def _get_cell_(savedict, key, six, nix, run=None):
@@ -941,6 +1183,48 @@ def _ladder_violins_(ax, savedict, keys, six, nix, run=None, ref_colors=None):
 	return {key: (positions[i], arrays[i]) for i, key in enumerate(keys)}
 
 
+def _decoding_violins_(ax, pe_dict, target, six, nix, run=None):
+	"""Violins of per-composition decoding MSE for the control ladder of one
+	PE target: constant, input-only, hidden state (left to right, in order of
+	the information available to each decoder). The state decoder wears the
+	accent, its controls grey. Returns {decoder: per-composition array}, jointly
+	NaN-filtered so the arrays stay paired for the stats brackets.
+	"""
+	greys  = {'b': '#9e9e9e', 'x': '#4d4d4d'}
+	accent = _model_colors_()['pred_err']
+	order  = ['b', 'x', 'h']
+
+	arrays = {d: _get_cell_(pe_dict, f'dec_{target}_{d}', six, nix, run=run)
+			  for d in order}
+	ok     = np.all([np.isfinite(arrays[d]) & (arrays[d] > 0) for d in order], axis=0)
+
+	# Decoding MSE is ratio-scale and heavy-tailed across compositions, so the
+	# densities are estimated on log values and the axis is labelled in the
+	# original units. This also matches the log-scale effect sizes of Fig 5, so
+	# the bracket here and the heatmap there report the same statistic
+	cols = {d: np.log(arrays[d][ok]) for d in order}
+
+	for pos, d in enumerate(order):
+		parts = ax.violinplot([cols[d]], positions=[pos], showextrema=False,
+							  widths=0.8)
+		body = parts['bodies'][0]
+		c = accent if d == 'h' else greys[d]
+		body.set_facecolor(c)
+		body.set_edgecolor(c)
+		body.set_alpha(0.6)
+
+	lo, hi = min(v.min() for v in cols.values()), max(v.max() for v in cols.values())
+	ticks  = [t for t in [1e-4, 1e-3, 1e-2, 1e-1, 1e0] if lo - 0.5 <= np.log(t) <= hi + 0.5]
+	ax.set_yticks(np.log(ticks))
+	ax.set_yticklabels([f'{t:g}' for t in ticks])
+
+	ax.set_xticks(range(len(order)))
+	ax.set_xticklabels([PE_DECODER_LABELS[d] for d in order], fontsize=FONT_SIZE - 1)
+	ax.set_ylabel('decoding MSE (log scale)', fontsize=LABEL_SIZE)
+
+	return cols
+
+
 def _forest_plot_(ax, effects, intervals, labels):
 	"""Cohen's d per run with bootstrap CIs and a zero reference line."""
 	accent = _model_colors_()['pred_err']
@@ -986,9 +1270,143 @@ def _reference_scatter_(ax, rnn, refs, contrasts, ref_colors, lims=None,
 	return lims
 
 
-def _heatmap_(ax, values, annot, vmax, xlabel, ylabel):
-	"""Noise x n_hidden map of an effect size or a raw difference."""
-	pass
+def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False):
+	"""Per-cell contrast of the RNN against a reference over the whole sweep.
+
+	Returns (values, annot), both (n_hidden, noise) with hidden units on the rows
+	to match the heatmap layout. The contrast is signed reference - RNN, so a
+	positive value means the RNN reaches the lower error - its advantage reads as
+	the warm end of the diverging scale. Cells without data stay NaN / blank, and
+	p-values are Bonferroni-corrected over every finite cell.
+
+	`log=True` takes the effect size on log values, for the prediction-error
+	decoding MSEs. Those are ratio-scale and heavy-tailed across compositions: a
+	single unusually long test work (BWV 232, 23x the median length) decodes an
+	order of magnitude worse than the rest, which inflates the standard deviation
+	and drags Cohen's d towards zero even where the state decoder wins on nearly
+	every composition. On the log scale d is a standardised log-ratio, robust to
+	that outlier and comparable across noise levels. The BCE contrasts of Figs 3
+	and S2 are bounded and well behaved, and stay on the raw scale.
+	"""
+	noise, n_hidden = savedict['noise'], savedict['n_hidden']
+	shape = (len(n_hidden), len(noise))
+
+	values = np.full(shape, np.nan)
+	annot  = np.full(shape, '', dtype=object)
+
+	finite = [(i, j) for i in range(len(noise)) for j in range(len(n_hidden))
+			  if np.isfinite(_get_cell_(savedict, rnn_key, i, j)).any()]
+	bonferroni = max(len(finite), 1)
+
+	# With 14 noise levels a per-cell "d (p=..)" string is unreadable, and almost
+	# every cell is significant anyway. Annotate the value alone and flag the rare
+	# non-significant cell by parenthesising it (caption: parentheses = n.s.)
+	for i, j in finite:
+		rnn = _get_cell_(savedict, rnn_key, i, j)   # runs-averaged (140,)
+		ref = _get_cell_(savedict, ref_key, i, j)   # reference (140,)
+
+		ok = np.isfinite(rnn) & np.isfinite(ref)
+		if log:
+			ok &= (rnn > 0) & (ref > 0)
+		rnn, ref = rnn[ok], ref[ok]
+		if rnn.size < 2:
+			continue
+
+		# The Wilcoxon test is rank-based, so it is identical on either scale;
+		# only the effect size changes
+		cohen, pval = _compute_stats_(np.log(ref) if log else ref,
+									  np.log(rnn) if log else rnn)
+		values[j, i] = cohen if plot_cohen else (ref - rnn).mean()
+		text = _value_annot_(values[j, i])
+		annot[j, i]  = f'({text})' if pval * bonferroni > 0.05 else text
+
+	return values, annot
+
+
+def _pe_corr_map_(pe_dict, key='pe_std'):
+	"""Mean per-composition correlation per sweep cell, (n_hidden, noise).
+
+	The correlation is run-averaged per composition first (matching _get_cell_'s
+	convention), then averaged over the 140 compositions; the annotation carries
+	the mean r, parenthesised when the one-sample Wilcoxon against zero does not
+	survive Bonferroni over the finite cells.
+	"""
+	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
+
+	values = np.full((len(n_hidden), len(noise)), np.nan)
+	annot  = np.full(values.shape, '', dtype=object)
+
+	finite = [(i, j) for i in range(len(noise)) for j in range(len(n_hidden))
+			  if np.isfinite(_get_cell_(pe_dict, key, i, j)).any()]
+	bonferroni = max(len(finite), 1)
+
+	for i, j in finite:
+		r = _get_cell_(pe_dict, key, i, j)
+		r = r[np.isfinite(r)]
+		_, pval = _compute_stats_(r)
+		values[j, i] = r.mean()
+		text = _value_annot_(values[j, i])
+		annot[j, i]  = f'({text})' if pval * bonferroni > 0.05 else text
+
+	return values, annot
+
+
+def _value_annot_(value):
+
+	# Magnitude-aware number formatting, matching _beautify_annot_'s value part but
+	# without the p-value. Large effect sizes (decoding d explodes where the ANN
+	# has near-zero variance) are clipped to keep the cell legible
+	av = abs(value)
+	if av < 0.02:  return f'{value:.2g}'
+	if av < 0.2:   return f'{value:.3f}'
+	if av < 2:     return f'{value:.2f}'
+	if av < 20:    return f'{value:.1f}'
+	if av <= 100:  return f'{value:.0f}'
+	return '<-100' if value < 0 else '>100'
+
+
+def _mean_sem_vs_noise_(savedict, key, nix):
+
+	# Mean error at each noise level, with the SEM across the test corpus. Each
+	# composition's error is first averaged over the five runs (_get_cell_ does
+	# this for the RNN; references have a single value per composition), giving one
+	# number per opera; the mean and SD are then taken across those 140 opera, and
+	# the bar is SD / sqrt(n). The unit of dispersion is the composition, the unit
+	# of analysis throughout
+	noise = savedict['noise']
+	means = np.full(len(noise), np.nan)
+	sems  = np.full(len(noise), np.nan)
+
+	for i in range(len(noise)):
+		vals = _get_cell_(savedict, key, i, nix)     # run-averaged per composition
+		vals = vals[np.isfinite(vals)]
+		if vals.size:
+			means[i] = vals.mean()
+			sems[i]  = vals.std(ddof=1) / np.sqrt(vals.size)
+
+	return means, sems
+
+
+def _heatmap_(ax, values, annot, vmax, noise_vals, n_hidden_vals, cbar_label,
+			  cbar=True):
+	"""Noise x n_hidden map of an effect size or a raw difference.
+
+	Rows are network sizes, columns noise levels, matching plot_perfomance_summary
+	in the original figures.py. Diverging RdBu_r centred at zero so the warm end is
+	the RNN advantage (positive = reference - RNN > 0). The scale saturates at
+	+/-vmax; the exact value and its significance stay legible in the annotation
+	(e.g. decoding d blows up where the memoryless ANN has near-zero variance).
+	"""
+	sns.heatmap(values, cmap='RdBu_r', center=0, vmin=-vmax, vmax=vmax, ax=ax,
+				annot=annot, fmt='', annot_kws={'fontsize': FONT_SIZE - 3},
+				linewidths=0.3, linecolor='white', square=False, cbar=cbar,
+				cbar_kws={'pad': 0.02, 'label': cbar_label},
+				xticklabels=[f'{n:g}' for n in noise_vals], yticklabels=n_hidden_vals)
+	ax.set_xlabel('noise amplitude (σ)', fontsize=LABEL_SIZE)
+	ax.set_ylabel('hidden units', fontsize=LABEL_SIZE)
+	ax.tick_params(length=0)
+	plt.setp(ax.get_yticklabels(), rotation=0)
+	plt.setp(ax.get_xticklabels(), rotation=0)
 
 
 def _piano_roll_(ax, array, cmap='Greys', vmin=None, vmax=None,
@@ -1016,13 +1434,14 @@ def _piano_roll_(ax, array, cmap='Greys', vmin=None, vmax=None,
 
 def _load_example_model_(noise=EXAMPLE_NOISE, n_hidden=EXAMPLE_NHIDDEN,
 						 run=EXAMPLE_RUN, opera_ix=EXAMPLE_OPERA):
-	"""Load one trained network plus a test Chunker for the example panels.
+	"""Load one trained network and run it on the example composition.
 
-	Fig 1C and 2A need the per-timestep obs/pred outputs, which
-	Bachmodel.compute_pe_and_state does not return - it yields only pe, stm and
-	std. Call m.net(sample) directly under torch.no_grad() here rather than
-	widening the library API. Torch is imported lazily so the pickle-only figures
-	do not depend on it. Arrays are returned as (T, 12).
+	Returns the raw per-timestep tensors the example panels need - target, noisy
+	sample, both readouts and the hidden state - rather than the derived
+	quantities of Bachmodel.compute_pe_terms, since Figs 1-2 plot the readouts
+	themselves and Fig 4 recomputes its own magnitudes. Torch is imported lazily
+	so the pickle-only figures do not depend on it. Arrays are (T, 12), except
+	hidden which is (T, n_hidden).
 	"""
 	import torch
 	import bachbayes
@@ -1039,7 +1458,7 @@ def _load_example_model_(noise=EXAMPLE_NOISE, n_hidden=EXAMPLE_NHIDDEN,
 	song    = chunker.read_song_as_tensor(opera)
 
 	with torch.no_grad():
-		obs, pred, _ = m.net(song['sample'])
+		obs, pred, hidden = m.net(song['sample'])
 
 	as_np = lambda t: t[0].cpu().numpy()
 
@@ -1047,7 +1466,8 @@ def _load_example_model_(noise=EXAMPLE_NOISE, n_hidden=EXAMPLE_NHIDDEN,
 			'target': as_np(song['target']),
 			'sample': as_np(song['sample']),
 			'obs'   : as_np(obs),
-			'pred'  : as_np(pred)}
+			'pred'  : as_np(pred),
+			'hidden': as_np(hidden)}
 
 
 def make_all_figures():
