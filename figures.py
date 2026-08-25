@@ -120,7 +120,7 @@ PREDICTION_KEY    = ('pred_err', 'pred_markh')   # the headline comparison
 DECODING_LADDER   = ['obs_err', 'obs_high']
 
 # Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
-# dec_<target>_<decoder>, with targets raw (x_{t+1} - p_t), sig (y_{t+1} - p_t)
+# dec_<target>_<decoder>, with targets raw (y_{t+1} - p_t), sig (x_{t+1} - p_t)
 # and neg (the expected-but-absent omission component), and the control ladder
 # b (constant) / x (input-only) / h (hidden state). Encoding beyond input drive
 # requires h to beat x, since the state necessarily carries the observation it
@@ -135,8 +135,8 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 
 	A  architecture schematic - GRU with its two heads and the stage-1/stage-2
 	   freezing (drawn by hand externally; the function leaves a blank axis)
-	B  example stimulus: clean piano roll y_t over the noisy observation x_t
-	C  the same excerpt, target versus decoded y-hat_t
+	B  example stimulus: clean piano roll x_t over the noisy observation y_t
+	C  the same excerpt, target versus decoded x-hat_t
 	D  decoding error over the 140 test compositions, RNN versus memory-less ANN
 	"""
 	_set_plos_style_()
@@ -149,9 +149,9 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 
 	ex  = _load_example_model_()
 	sl  = slice(0, EXAMPLE_LENGTH)
-	y   = ex['target'][sl].T   # clean chords y_t   (12, L)
-	x   = ex['sample'][sl].T   # noisy observation x_t
-	yhat = ex['obs'][sl].T     # decoded y-hat_t
+	x   = ex['target'][sl].T   # clean latent tokens x_t   (12, L)
+	y   = ex['sample'][sl].T   # noisy observation y_t
+	xhat = ex['obs'][sl].T     # decoded x-hat_t
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 4.2))
 	gs  = fig.add_gridspec(2, 2, left=0.075, right=0.985, bottom=0.10, top=0.92,
@@ -167,14 +167,14 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 
 	# B - example stimulus: clean piano roll over the noisy observation
 	axB = fig.add_subplot(gs[0, 1])
-	_piano_roll_(axB, x, overlay=y)
-	axB.set_title('stimulus: noisy $x_t$, clean $y_t$ outlined', fontsize=FONT_SIZE)
+	_piano_roll_(axB, y, overlay=x)
+	axB.set_title('stimulus: noisy $y_t$, clean $x_t$ outlined', fontsize=FONT_SIZE)
 	_panel_label_(axB, 'B')
 
 	# C - target versus decoded
 	axC = fig.add_subplot(gs[1, 0])
-	_piano_roll_(axC, yhat, vmin=0, vmax=1, overlay=y)
-	axC.set_title('decoded $\\hat{y}_t$, target $y_t$ outlined', fontsize=FONT_SIZE)
+	_piano_roll_(axC, xhat, vmin=0, vmax=1, overlay=x)
+	axC.set_title('decoded $\\hat{x}_t$, target $x_t$ outlined', fontsize=FONT_SIZE)
 	_panel_label_(axC, 'C')
 
 	# D - decoding error over the 140 test compositions, RNN versus ANN
@@ -197,7 +197,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	"""Prediction emerges in a single network.
 
-	A  excerpt of the upcoming chord y_{t+1} against the network's prediction p_t
+	A  excerpt of the upcoming token x_{t+1} against the network's prediction p_t
 	B  the reference ladder over the 140 test compositions, with colour-coded stats
 	   brackets for the three key contrasts (RNN vs Markov-high, Markov-low and the
 	   prediction-trained GRU); the global distribution is the floor, reported in text
@@ -215,7 +215,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 
 	ex     = _load_example_model_()
 	sl     = slice(0, EXAMPLE_LENGTH)
-	y_next = ex['target'][1:EXAMPLE_LENGTH + 1].T   # upcoming chord y_{t+1}
+	x_next = ex['target'][1:EXAMPLE_LENGTH + 1].T   # upcoming token x_{t+1}
 	p      = ex['pred'][sl].T                        # prediction p_t
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 4.8))
@@ -225,8 +225,8 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 
 	# A - upcoming chord against the network's prediction
 	axA = fig.add_subplot(gs[0, :])
-	_piano_roll_(axA, p, vmin=0, vmax=1, overlay=y_next)
-	axA.set_title('prediction $p_t$, upcoming chord $y_{t+1}$ outlined',
+	_piano_roll_(axA, p, vmin=0, vmax=1, overlay=x_next)
+	axA.set_title('prediction $p_t$, upcoming chord $x_{t+1}$ outlined',
 				  fontsize=FONT_SIZE)
 	_panel_label_(axA, 'A')
 
@@ -340,7 +340,7 @@ def fig04_pe_one_net(fname='fig04_pe-one-net.pdf'):
 	   magnitude for one test composition (silence-padding frames blanked)
 	B  per-timestep scatter of the two, with the correlation - the
 	   innovation-driven-updating signature of Kalman-style filtering
-	C  decoding the signal innovation y_{t+1} - p_t over the 140 compositions:
+	C  decoding the signal innovation x_{t+1} - p_t over the 140 compositions:
 	   constant vs input-only vs hidden-state decoder. The input-only rung is the
 	   critical control: the state necessarily carries the observation it has just
 	   consumed, so only state > input demonstrates encoding beyond input drive
@@ -397,8 +397,8 @@ def fig04_pe_one_net(fname='fig04_pe-one-net.pdf'):
 
 	# C, D - decoding ladders at the exemplar cell (single network, run 0)
 	for ax, target, letter, title in [
-			(fig.add_subplot(gs[1, :3]), 'sig', 'C', 'signal innovation  $y_{t+1} - p_t$'),
-			(fig.add_subplot(gs[1, 3:]), 'neg', 'D', 'omissions  $(p_t - y_{t+1})_+$')]:
+			(fig.add_subplot(gs[1, :3]), 'sig', 'C', 'signal innovation  $x_{t+1} - p_t$'),
+			(fig.add_subplot(gs[1, 3:]), 'neg', 'D', 'omissions  $(p_t - x_{t+1})_+$')]:
 
 		# cols holds log MSE, so the bracket reports the log-scale effect size
 		cols = _decoding_violins_(ax, pe_dict, target, six, nix, run=EXAMPLE_RUN)
@@ -1413,8 +1413,8 @@ def _piano_roll_(ax, array, cmap='Greys', vmin=None, vmax=None,
 				 overlay=None, overlay_color='#0072b2'):
 	"""12 x time chord matrix; optional binary overlay drawn as outlined cells.
 
-	array is (12, T), pitch class on y and time on x. overlay, when given, is a
-	(12, T) binary matrix (e.g. the clean target) marked as coloured cell
+	array is (12, T), pitch class on rows and time on columns. overlay, when
+	given, is a (12, T) binary matrix (e.g. the clean latents) marked as coloured cell
 	outlines over the continuous background (e.g. the noisy or decoded field).
 	"""
 	n_time = array.shape[1]
