@@ -95,7 +95,7 @@ REPORT_RESOLUTION = 1e-4
 # translation lives here instead
 MODEL_LABELS = {
 	'obs_err'   : 'RNN',
-	'obs_high'  : 'memory-less ANN',
+	'obs_high'  : 'memory-less logistic',
 	'pred_err'  : 'RNN (probed)',
 	'pred_low'  : 'prediction-trained GRU',
 	'pred_markl': '1st-order Markov\n(clean input)',
@@ -137,7 +137,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 	   freezing (drawn by hand externally; the function leaves a blank axis)
 	B  example stimulus: clean piano roll x_t over the noisy observation y_t
 	C  the same excerpt, target versus decoded x-hat_t
-	D  decoding error over the 140 test compositions, RNN versus memory-less ANN
+	D  decoding error over the 140 test compositions, RNN versus memory-less logistic
 	"""
 	_set_plos_style_()
 
@@ -179,7 +179,8 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 
 	# D - decoding error over the 140 test compositions, RNN versus ANN
 	axD  = fig.add_subplot(gs[1, 1])
-	pos  = _ladder_violins_(axD, savedict, DECODING_LADDER, six, nix, run=EXAMPLE_RUN)
+	pos  = _ladder_violins_(axD, savedict, DECODING_LADDER, six, nix, run=EXAMPLE_RUN,
+							ref_colors=_decoding_ref_colors_())
 	cols = {k: pos[k][1] for k in pos}
 	ymax = max(np.max(v) for v in cols.values())
 
@@ -245,7 +246,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	axB.set_ylim(ymin - 0.05, ymax * 1.42)
 	xe = pos['pred_err'][0]
 	for i, key in enumerate(contrasts):
-		_write_stats_pair_(axB, cols, 'pred_err', key, x0=xe, x1=pos[key][0],
+		_write_stats_pair_(axB, cols, key, 'pred_err', x0=xe, x1=pos[key][0],
 						   y=ymax * (1.03 + 0.115 * i), color=ref_colors[key])
 	axB.set_ylabel('prediction error (BCE)', fontsize=LABEL_SIZE)
 	for lbl in axB.get_xticklabels():
@@ -643,18 +644,18 @@ def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
 			ax.set_xlabel('RNN (probed) error', fontsize=LABEL_SIZE)
 		_panel_label_(ax, chr(ord('A') + idx))
 
-	# Panel F: grouped forest of Cohen's d (RNN - reference), one row per
+	# Panel F: grouped forest of Cohen's d (reference - RNN), one row per
 	# reference x run, grouped by reference (model 1 on top), run 1 first within
-	# each group. d matches Fig 2's sign convention (RNN - reference), so points
-	# right of zero mean the RNN trails
+	# each group. d matches the sign convention used throughout (reference - RNN),
+	# so points right of zero mean the RNN wins
 	axf       = fig.add_subplot(gs[1, 2])
 	group_gap = 1.0
 	yticks, yticklabels = [], []
 	for j, key in enumerate(contrasts):
 		base = j * (len(runs) + group_gap)
 		for i, r in enumerate(runs):
-			d, _   = _compute_stats_(rnn[r], refs[key])
-			lo, hi = _bootstrap_ci_(rnn[r], refs[key])
+			d, _   = _compute_stats_(refs[key], rnn[r])
+			lo, hi = _bootstrap_ci_(refs[key], rnn[r])
 			axf.errorbar(d, base + i, xerr=[[d - lo], [hi - d]], fmt='o',
 						 color=ref_colors[key], markersize=2.5, elinewidth=0.8,
 						 capsize=1.5)
@@ -666,7 +667,7 @@ def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
 	axf.set_ylim(y_bot, -0.5)           # model 1 / run 1 (smallest y) on top
 	axf.set_yticks(yticks)
 	axf.set_yticklabels(yticklabels, fontsize=FONT_SIZE - 2)
-	axf.set_xlabel("Cohen's d (RNN $-$ reference)", fontsize=LABEL_SIZE)
+	axf.set_xlabel("Cohen's d (reference $-$ RNN)", fontsize=LABEL_SIZE)
 
 	handles = [plt.Line2D([], [], color=ref_colors[k], marker='o', linestyle='',
 						  markersize=3) for k in contrasts]
@@ -959,6 +960,17 @@ def _reference_colors_():
 		'pred_low'  : '#e69f00',   # prediction-trained GRU - the trainable ceiling
 		'pred_high' : '#cc79a7',   # global distribution - floor, coloured but not scattered
 	}
+
+
+def _decoding_ref_colors_():
+
+	# Fig 1D uses the same two-channel scheme as Fig 2B - white body for the
+	# probed RNN, colour for the reference - so the two violin panels read alike.
+	# Okabe-Ito sky blue is the one hue left unclaimed by _reference_colors_'s
+	# four prediction benchmarks, and it never stands for the RNN (that is the
+	# darker #0072b2, which the white body replaces here). Its sub-3:1 contrast
+	# on white is cleared the same way Fig 2B clears orange: by direct labelling
+	return {'obs_high': '#56b4e9'}
 
 
 def _model_linestyles_():
