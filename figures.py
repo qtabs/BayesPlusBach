@@ -9,15 +9,16 @@ then across the noise x network-size sweep:
 
   Fig 1  task, architecture, and evidence the denoising task was solved
   Fig 2  prediction emerges - single network
-  Fig 3  prediction emerges - across the sweep
-  Fig 4  prediction errors are encoded - single network
-  Fig 5  prediction errors are encoded - across the sweep
+  Fig 3  prediction emerges - error against noise at the exemplar size
+  Fig 4  prediction emerges - the three contrasts across the sweep
+  Fig 5  prediction errors are encoded - single network
+  Fig 6  prediction errors are encoded - across the sweep
   S1     training loss timecourses
   S2     decoding across the sweep
   S3     the prediction effect replicates across the five runs
   S4     PE encoding replicates across the five runs
 
-The prediction-error figures (4, 5, S4) read results/pe_results.pickle, written by
+The prediction-error figures (5, 6, S4) read results/pe_results.pickle, written by
 pipeline.prediction_error_analysis_pipeline(). Their design answers the input-drive
 confound: the state necessarily encodes the observation it has just consumed, so PE
 encoding is only claimed where a state decoder beats an input-only control - most
@@ -267,13 +268,12 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	_save_(fig, fname)
 
 
-def fig03_prediction_sweep(fname='fig03_prediction-sweep.pdf'):
-	"""Prediction across the noise x network-size sweep.
+def fig03_prediction_vs_noise(fname='fig03_prediction-vs-noise.pdf'):
+	"""Prediction error against noise amplitude at the exemplar network size.
 
-	A  error against noise amplitude at the exemplar network size, one line per
-	   ladder model - shows how the gap opens as the channel degrades
-	B  heatmap of Cohen's d, RNN versus Markov-high, over the sweep
-	C  heatmap of the same contrast in raw BCE units
+	One line per ladder model - shows how the gap between the probed RNN and its
+	references opens as the channel degrades. The sweep over network sizes is
+	Fig 4; this panel fixes N and varies sigma alone.
 	"""
 	_set_plos_style_()
 
@@ -284,16 +284,14 @@ def fig03_prediction_sweep(fname='fig03_prediction-sweep.pdf'):
 	noise, n_hidden = savedict['noise'], savedict['n_hidden']
 	nix = n_hidden.index(EXAMPLE_NHIDDEN)
 
-	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
-	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
-						   hspace=0.5, height_ratios=[1.1, 1, 1])
-
-	# A - error vs noise at the exemplar size, one line per model. Noise is the
-	# x axis here, so colour is free to carry model identity (accent for the RNN,
+	# Error vs noise at the exemplar size, one line per model. Noise is the x
+	# axis here, so colour is free to carry model identity (accent for the RNN,
 	# reference categorical colours). Error bars are +/- SEM across the 140 test
 	# compositions, after averaging each composition over the five runs - the
 	# spread of the corpus, not a between-network estimate
-	axA = fig.add_subplot(gs[0])
+	fig = plt.figure(figsize=(FIG_WIDTH, 2.9))
+	axA = fig.add_subplot(111)
+	fig.subplots_adjust(left=0.10, right=0.99, bottom=0.19, top=0.90)
 	ref_colors = _reference_colors_()
 	xs = np.arange(len(noise))
 
@@ -310,31 +308,57 @@ def fig03_prediction_sweep(fname='fig03_prediction-sweep.pdf'):
 	axA.set_xticklabels([f'{n:g}' for n in noise], fontsize=FONT_SIZE - 1)
 	axA.set_xlabel('noise amplitude (σ)', fontsize=LABEL_SIZE)
 	axA.set_ylabel('prediction error (BCE)', fontsize=LABEL_SIZE)
-	axA.set_title(f'n = {EXAMPLE_NHIDDEN} hidden units', fontsize=FONT_SIZE, pad=2)
+	axA.set_title(f'N = {EXAMPLE_NHIDDEN} hidden units', fontsize=FONT_SIZE, pad=2)
 	axA.legend(fontsize=FONT_SIZE - 2, frameon=False, loc='lower right', ncol=2,
 			   handlelength=1.4, columnspacing=1.0, labelspacing=0.3)
-	_panel_label_(axA, 'A')
-
-	# B - Cohen's d of the headline contrast (Markov-high - RNN); warm = RNN wins
-	axB = fig.add_subplot(gs[1])
-	vals, annot = _sweep_maps_(savedict, 'pred_markh', 'pred_err', plot_cohen=True)
-	_heatmap_(axB, vals, annot, vmax=1.5, noise_vals=noise, n_hidden_vals=n_hidden,
-			  cbar_label="Cohen's d")
-	axB.set_title('emergent prediction: RNN vs Markov-high (noisy input)',
-				  fontsize=FONT_SIZE, pad=3)
-	_panel_label_(axB, 'B')
-
-	# C - the same contrast in raw BCE units
-	axC = fig.add_subplot(gs[2])
-	vals, annot = _sweep_maps_(savedict, 'pred_markh', 'pred_err', plot_cohen=False)
-	_heatmap_(axC, vals, annot, vmax=0.07, noise_vals=noise, n_hidden_vals=n_hidden,
-			  cbar_label='Δ BCE')
-	_panel_label_(axC, 'C')
 
 	_save_(fig, fname)
 
 
-def fig04_pe_one_net(fname='fig04_pe-one-net.pdf'):
+def fig04_prediction_sweep(fname='fig04_prediction-sweep.pdf'):
+	"""The prediction contrasts across the noise x network-size sweep.
+
+	One heatmap per reference, all signed reference - RNN and on a shared
+	Cohen's d scale so the three panels are directly comparable (warm = the RNN
+	reaches the lower error):
+
+	A  vs the liberal Markov reference (noisy input, the RNN's own channel)
+	B  vs the conservative Markov reference (clean input)
+	C  vs the prediction-trained RNN, the empirical ceiling the probed readout
+	   is not expected to reach
+	"""
+	_set_plos_style_()
+
+	savedict = _load_results_()
+	if not _require_(savedict, PREDICTION_LADDER, 'results.pickle'):
+		return
+
+	noise, n_hidden = savedict['noise'], savedict['n_hidden']
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
+	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
+						   hspace=0.5)
+
+	# A shared vmax keeps the three panels on one scale: every cell of every
+	# contrast falls within |d| < 1.7, so 1.5 saturates only the extremes and the
+	# annotation carries the exact value where it does
+	panels = [('pred_markh', 'A', 'emergent prediction: RNN vs liberal Markov '
+			   '(noisy input)'),
+			  ('pred_markl', 'B', 'RNN vs conservative Markov (clean input)'),
+			  ('pred_low',   'C', 'RNN vs prediction-trained RNN (empirical ceiling)')]
+
+	for row, (key, letter, title) in enumerate(panels):
+		ax = fig.add_subplot(gs[row])
+		vals, annot = _sweep_maps_(savedict, key, 'pred_err', plot_cohen=True)
+		_heatmap_(ax, vals, annot, vmax=1.5, noise_vals=noise,
+				  n_hidden_vals=n_hidden, cbar_label="Cohen's d")
+		ax.set_title(title, fontsize=FONT_SIZE, pad=3)
+		_panel_label_(ax, letter)
+
+	_save_(fig, fname)
+
+
+def fig05_pe_one_net(fname='fig05_pe-one-net.pdf'):
 	"""Prediction errors drive and inhabit the state, in a single network.
 
 	A  z-scored timecourses of the innovation magnitude and the state-update
@@ -413,7 +437,7 @@ def fig04_pe_one_net(fname='fig04_pe-one-net.pdf'):
 	_save_(fig, fname)
 
 
-def fig05_pe_sweep(fname='fig05_pe-sweep.pdf'):
+def fig06_pe_sweep(fname='fig06_pe-sweep.pdf'):
 	"""Prediction-error encoding across the sweep.
 
 	A  heatmap of the innovation / state-update correlation (mean per-composition
@@ -721,7 +745,7 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	# B, C - the decoding contrast per run: d of paired input-only minus state MSE
 	for ax, target, letter, title in [(axs[1], 'sig', 'B', 'signal innovation'),
 									  (axs[2], 'neg', 'C', 'omissions')]:
-		# Log MSE, matching Fig 5: the raw scale is heavy-tailed across
+		# Log MSE, matching Fig 6: the raw scale is heavy-tailed across
 		# compositions and understates a consistent effect (see _sweep_maps_)
 		effects, intervals = [], []
 		for r in runs:
@@ -1212,7 +1236,7 @@ def _decoding_violins_(ax, pe_dict, target, six, nix, run=None):
 
 	# Decoding MSE is ratio-scale and heavy-tailed across compositions, so the
 	# densities are estimated on log values and the axis is labelled in the
-	# original units. This also matches the log-scale effect sizes of Fig 5, so
+	# original units. This also matches the log-scale effect sizes of Fig 6, so
 	# the bracket here and the heatmap there report the same statistic
 	cols = {d: np.log(arrays[d][ok]) for d in order}
 
@@ -1297,7 +1321,7 @@ def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False):
 	order of magnitude worse than the rest, which inflates the standard deviation
 	and drags Cohen's d towards zero even where the state decoder wins on nearly
 	every composition. On the log scale d is a standardised log-ratio, robust to
-	that outlier and comparable across noise levels. The BCE contrasts of Figs 3
+	that outlier and comparable across noise levels. The BCE contrasts of Figs 4
 	and S2 are bounded and well behaved, and stay on the raw scale.
 	"""
 	noise, n_hidden = savedict['noise'], savedict['n_hidden']
@@ -1451,7 +1475,7 @@ def _load_example_model_(noise=EXAMPLE_NOISE, n_hidden=EXAMPLE_NHIDDEN,
 	Returns the raw per-timestep tensors the example panels need - target, noisy
 	sample, both readouts and the hidden state - rather than the derived
 	quantities of Bachmodel.compute_pe_terms, since Figs 1-2 plot the readouts
-	themselves and Fig 4 recomputes its own magnitudes. Torch is imported lazily
+	themselves and Fig 5 recomputes its own magnitudes. Torch is imported lazily
 	so the pickle-only figures do not depend on it. Arrays are (T, 12), except
 	hidden which is (T, n_hidden).
 	"""
