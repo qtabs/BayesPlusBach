@@ -90,14 +90,14 @@ REPORT_RESOLUTION = 1e-4
 
 # Display names for the keys stored in results.pickle. The stored names are
 # counter-intuitive - 'pred_high' is the global distribution, i.e. the *worst*
-# predictor, and 'pred_low' the prediction-trained GRU, the best - but renaming
+# predictor, and 'pred_low' the prediction-trained RNN, the best - but renaming
 # them in the pickle would invalidate every result already computed, so the
 # translation lives here instead
 MODEL_LABELS = {
 	'obs_err'   : 'RNN',
 	'obs_high'  : 'memory-less logistic',
 	'pred_err'  : 'RNN (probed)',
-	'pred_low'  : 'prediction-trained GRU',
+	'pred_low'  : 'prediction-trained RNN',
 	'pred_markl': '1st-order Markov\n(clean input)',
 	'pred_markh': '1st-order Markov\n(noisy input)',
 	'pred_high' : 'global distribution',
@@ -108,7 +108,7 @@ MODEL_LABELS = {
 # right as listed. The probed RNN is deliberately flanked by its two matched
 # first-order bounds: Markov-low (clean current state, a lower bound on error) on
 # its left and Markov-high (same noisy channel as the RNN, the upper bound it must
-# beat) on its right. The outer pair frames the scale: the prediction-trained GRU
+# beat) on its right. The outer pair frames the scale: the prediction-trained RNN
 # is the empirical ceiling (best the architecture reaches when trained to predict)
 # and the global distribution the trivial floor (methods.tex Eq 5). The headline
 # claim is RNN < Markov-high: both see the noisy channel, so the gap is emergent
@@ -201,7 +201,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	A  excerpt of the upcoming token x_{t+1} against the network's prediction p_t
 	B  the reference ladder over the 140 test compositions, with colour-coded stats
 	   brackets for the three key contrasts (RNN vs Markov-high, Markov-low and the
-	   prediction-trained GRU); the global distribution is the floor, reported in text
+	   prediction-trained RNN); the global distribution is the floor, reported in text
 	C  per-composition scatter of RNN error against the same three references, one
 	   colour per reference with an identity line, sharing B's colour legend and
 	   showing the contrasts are not carried by a handful of compositions
@@ -599,7 +599,7 @@ def figS3_prediction_reliability(fname='figS3_prediction-reliability.pdf'):
 	The composition stays the unit of analysis (n = 140); each contrast is
 	repeated independently within every run rather than on the run average. The
 	three references are the same as Fig 2 - Markov-high, Markov-low and the
-	prediction-trained GRU - and carry the same colours.
+	prediction-trained RNN - and carry the same colours.
 
 	Panels A-E  per-run scatter of RNN error against the three references, with a
 	            shared identity line and axes (2 x 3 grid)
@@ -957,7 +957,7 @@ def _reference_colors_():
 	return {
 		'pred_markh': '#d55e00',   # 1st-order Markov, noisy input - primary contrast
 		'pred_markl': '#009e73',   # 1st-order Markov, clean input
-		'pred_low'  : '#e69f00',   # prediction-trained GRU - the trainable ceiling
+		'pred_low'  : '#e69f00',   # prediction-trained RNN - the trainable ceiling
 		'pred_high' : '#cc79a7',   # global distribution - floor, coloured but not scattered
 	}
 
