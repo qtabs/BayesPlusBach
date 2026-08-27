@@ -337,17 +337,24 @@ class Bachmodel():
 		"""Per-timestep quantities for the prediction-error analyses.
 
 		Every series is aligned on the predicted frame: index i refers to frame
-		t = i+1, whose prediction yhat_t was formed from the state h_{t-1} after
-		frame t-1 = i. A hatted symbol estimates the quantity of the same index,
-		so yhat_t is the prediction of y_t. Returned keys:
+		t = i+1, whose prediction xhat_{t|t-1} was formed from the state h_{t-1}
+		after frame t-1 = i. Conditional-bar notation follows the filtering
+		literature: xhat_{t|t-1} is the estimate of x_t given observations up to
+		t-1 (the prediction head), xhat_{t|t} the estimate given observations up
+		to t (the observation head). Both readouts are sigmoids scored with BCE,
+		so each is a Bernoulli probability p(x_t = 1 | .) and, x_t being binary,
+		equal to the conditional expectation E[x_t | .]. Since the observation
+		noise is zero-mean, E[y_t | y_{1:t-1}] = xhat_{t|t-1} as well, which is
+		what makes pe_raw an innovation rather than a mismatch of types.
+		Returned keys:
 
-		  pe_raw  y_t - yhat_t: the network-visible prediction error; its
+		  pe_raw  y_t - xhat_{t|t-1}: the network-visible prediction error; its
 		          magnitude scales with the noise parameter
-		  pe_sig  x_t - yhat_t: the signal prediction error. The raw error also
+		  pe_sig  x_t - xhat_{t|t-1}: the signal prediction error. The raw error also
 		          contains the observation noise, which the state trivially
 		          carries because it has just consumed y_t; the signal part
 		          is the component whose encoding is informative
-		  pe_neg  max(yhat_t - x_t, 0): the expected-but-absent component
+		  pe_neg  max(xhat_{t|t-1} - x_t, 0): the expected-but-absent component
 		          (omissions). At an omission the input holds no trace of the
 		          error, so this part cannot be reconstructed from the current
 		          observation alone - the model analogue of omission responses

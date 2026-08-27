@@ -121,7 +121,7 @@ PREDICTION_KEY    = ('pred_err', 'pred_markh')   # the headline comparison
 DECODING_LADDER   = ['obs_err', 'obs_high']
 
 # Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
-# dec_<target>_<decoder>, with targets raw (y_t - yhat_t), sig (x_t - yhat_t)
+# dec_<target>_<decoder>, with targets raw (y_t - xhat_{t|t-1}), sig (x_t - xhat_{t|t-1})
 # and neg (the expected-but-absent omission component), and the control ladder
 # b (constant) / y (input-only) / h (hidden state). Encoding beyond input drive
 # requires h to beat y, since the state necessarily carries the observation it
@@ -137,7 +137,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 	A  architecture schematic - GRU with its two heads and the stage-1/stage-2
 	   freezing (drawn by hand externally; the function leaves a blank axis)
 	B  example stimulus: clean piano roll x_t over the noisy observation y_t
-	C  the same excerpt, target versus decoded x-hat_t
+	C  the same excerpt, target versus the decoded xhat_{t|t}
 	D  decoding error over the 140 test compositions, RNN versus memory-less logistic
 	"""
 	_set_plos_style_()
@@ -152,7 +152,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 	sl  = slice(0, EXAMPLE_LENGTH)
 	x   = ex['target'][sl].T   # clean latent tokens x_t   (12, L)
 	y   = ex['sample'][sl].T   # noisy observation y_t
-	xhat = ex['obs'][sl].T     # decoded x-hat_t
+	xhat = ex['obs'][sl].T     # decoded xhat_{t|t}
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 4.2))
 	gs  = fig.add_gridspec(2, 2, left=0.075, right=0.985, bottom=0.10, top=0.92,
@@ -175,7 +175,7 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 	# C - target versus decoded
 	axC = fig.add_subplot(gs[1, 0])
 	_piano_roll_(axC, xhat, vmin=0, vmax=1, overlay=x)
-	axC.set_title('decoded $\\hat{x}_t$, target $x_t$ outlined', fontsize=FONT_SIZE)
+	axC.set_title('decoded $\\hat{x}_{t|t}$, target $x_t$ outlined', fontsize=FONT_SIZE)
 	_panel_label_(axC, 'C')
 
 	# D - decoding error over the 140 test compositions, RNN versus ANN
@@ -200,7 +200,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	"""Prediction emerges in a single network.
 
 	A  excerpt of the upcoming token x_{t+1} against the network's prediction
-	   yhat_{t+1}
+	   xhat_{t+1|t}
 	B  the reference ladder over the 140 test compositions, with colour-coded stats
 	   brackets for the three key contrasts (RNN vs Markov-high, Markov-low and the
 	   prediction-trained RNN); the global distribution is the floor, reported in text
@@ -219,7 +219,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	ex     = _load_example_model_()
 	sl     = slice(0, EXAMPLE_LENGTH)
 	x_next = ex['target'][1:EXAMPLE_LENGTH + 1].T   # upcoming token x_{t+1}
-	p      = ex['pred'][sl].T                        # prediction yhat_{t+1}
+	p      = ex['pred'][sl].T                        # prediction xhat_{t+1|t}
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 4.8))
 	gs  = fig.add_gridspec(2, 2, left=0.09, right=0.985, bottom=0.20, top=0.92,
@@ -229,7 +229,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	# A - upcoming chord against the network's prediction
 	axA = fig.add_subplot(gs[0, :])
 	_piano_roll_(axA, p, vmin=0, vmax=1, overlay=x_next)
-	axA.set_title('prediction $\\hat{y}_{t+1}$, upcoming chord $x_{t+1}$ outlined',
+	axA.set_title('prediction $\\hat{x}_{t+1|t}$, upcoming chord $x_{t+1}$ outlined',
 				  fontsize=FONT_SIZE)
 	_panel_label_(axA, 'A')
 
@@ -383,7 +383,8 @@ def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
 	accent   = _model_colors_()['pred_err']
 
 	# Example-network series, computed on the fly (mirrors compute_pe_terms).
-	# Index i is frame t = i+1, so e_t = y_t - yhat_t sits against dh_t = h_t - h_{t-1}
+	# Index i is frame t = i+1, so e_t = y_t - xhat_{t|t-1} sits against
+	# dh_t = h_t - h_{t-1}
 	ex   = _load_example_model_()
 	pe2  = ((ex['sample'][1:] - ex['pred'][:-1]) ** 2).mean(1)
 	std2 = ((ex['hidden'][1:] - ex['hidden'][:-1]) ** 2).mean(1)
@@ -466,7 +467,7 @@ def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
 def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 	"""The prediction error is decodable from the state, beyond input drive.
 
-	A  decoding the signal prediction error x_t - yhat_t over the 140
+	A  decoding the signal prediction error x_t - xhat_{t|t-1} over the 140
 	   compositions of the exemplar cell: constant vs input-only vs hidden-state
 	   decoder. The input-only rung is the critical control: the state
 	   necessarily carries the observation it has just consumed, so only
@@ -493,8 +494,8 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 
 	# A, B - decoding ladders at the exemplar cell (single network, run 0)
 	for col, target, letter, title in [
-			(0, 'sig', 'A', 'signal prediction error  $x_t - \\hat{y}_t$'),
-			(1, 'neg', 'B', 'omissions  $(\\hat{y}_t - x_t)_+$')]:
+			(0, 'sig', 'A', 'signal prediction error  $x_t - \\hat{x}_{t|t-1}$'),
+			(1, 'neg', 'B', 'omissions  $(\\hat{x}_{t|t-1} - x_t)_+$')]:
 
 		ax = fig.add_subplot(gs[0, col])
 		# cols holds log MSE, so the bracket reports the log-scale effect size
