@@ -19,7 +19,7 @@ N_RUNS_TRAIN  = 5    # runs trained by default (extendable up to N_RUNS for free
 N_REF         = 256  # reference models are capacity-saturated (max of the sweep)
 
 ## PE analysis
-# 'raw' == innovation; 'sig' == signal component; 'neg' == omission component
+# 'raw' == prediction error; 'sig' == signal component; 'neg' == omission component
 PE_TARGETS  = ['raw', 'sig', 'neg']
 # Control ladder: 'b' == constant decoder; 'y' == observation; 'h' == hidden state
 PE_DECODERS = ['b', 'y', 'h']
@@ -323,7 +323,7 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 	operas        = sorted(bachbayes.Chunker('./test', 1, None, True, 0, seed=bachbayes.EVAL_SEED).song_pool)
 
 	# Per-composition metrics, all (noise, n_hidden, run, opera): the correlation
-	# between innovation magnitude and state-update magnitude, plus the decoding
+	# between prediction-error magnitude and state-update magnitude, plus the decoding
 	# MSE for every target x decoder pair of the ladder
 	metric_names = ['pe_std'] + [f'dec_{t}_{d}' for t in PE_TARGETS for d in PE_DECODERS]
 	shape        = (len(noise_vals), len(n_hidden_vals), n_runs, len(operas))

@@ -25,7 +25,7 @@ Driver script that runs the experiments end to end:
 - `main_fitting()`: trains a GRU first on denoising (prediction readout frozen), then trains the prediction readout on top of the frozen recurrent weights, and reports observation and prediction errors.
 - `baselines()`: fits the reference models used as upper/lower bounds — the memory-less logistic decoder, the global note distribution, first-order Markov with noisy or ground-truth input, and a GRU trained directly to predict. These estimate properties of the task rather than of any one network, so they are computed once per noise level at saturated capacity instead of being width-matched to each RNN of the sweep.
 - `pipeline()` and `baselines_pipeline()`: sweep noise levels × hidden-unit counts × runs, calling the above and storing results in `results/results.pickle`. Both are resumable — finished cells are checkpointed on disk and reloaded rather than refitted, so an interrupted sweep continues where it stopped.
-- `prediction_error_analysis_pipeline()`: for each fitted model, correlates the innovation magnitude with the state-update magnitude, then decodes each prediction-error target from a constant, from the input alone, and from the hidden state. Writes `results/pe_results.pickle` with `pe_std` plus one entry per target × decoder pair (`dec_{raw,sig,neg}_{b,x,h}`), resuming per cell.
+- `prediction_error_analysis_pipeline()`: for each fitted model, correlates the prediction-error magnitude with the state-update magnitude, then decodes each prediction-error target from a constant, from the input alone, and from the hidden state. Writes `results/pe_results.pickle` with `pe_std` plus one entry per target × decoder pair (`dec_{raw,sig,neg}_{b,x,h}`), resuming per cell.
 
 ### `figures.py` ###
 
@@ -35,9 +35,10 @@ Figure factory for the manuscript. Every `figNN_*` (main) and `figSN_*` (supplem
 |---|---|
 | Fig 1 | task, architecture, and evidence the denoising task was solved |
 | Fig 2 | prediction emerges — single network |
-| Fig 3 | prediction emerges — across the sweep |
-| Fig 4 | prediction errors are encoded — single network |
-| Fig 5 | prediction errors are encoded — across the sweep |
+| Fig 3 | prediction error against noise, at the exemplar size |
+| Fig 4 | the prediction contrasts across the sweep |
+| Fig 5 | prediction errors drive the state update |
+| Fig 6 | prediction errors are decodable from the state |
 | S1 | training loss timecourses |
 | S2 | decoding across the sweep |
 | S3 | the prediction effect replicates across the five runs |

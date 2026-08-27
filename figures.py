@@ -121,7 +121,7 @@ PREDICTION_KEY    = ('pred_err', 'pred_markh')   # the headline comparison
 DECODING_LADDER   = ['obs_err', 'obs_high']
 
 # Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
-# dec_<target>_<decoder>, with targets raw (y_{t+1} - p_t), sig (x_{t+1} - p_t)
+# dec_<target>_<decoder>, with targets raw (y_t - yhat_t), sig (x_t - yhat_t)
 # and neg (the expected-but-absent omission component), and the control ladder
 # b (constant) / y (input-only) / h (hidden state). Encoding beyond input drive
 # requires h to beat y, since the state necessarily carries the observation it
@@ -199,7 +199,8 @@ def fig01_task_and_decoding(fname='fig01_task-and-decoding.pdf'):
 def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	"""Prediction emerges in a single network.
 
-	A  excerpt of the upcoming token x_{t+1} against the network's prediction p_t
+	A  excerpt of the upcoming token x_{t+1} against the network's prediction
+	   yhat_{t+1}
 	B  the reference ladder over the 140 test compositions, with colour-coded stats
 	   brackets for the three key contrasts (RNN vs Markov-high, Markov-low and the
 	   prediction-trained RNN); the global distribution is the floor, reported in text
@@ -218,7 +219,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	ex     = _load_example_model_()
 	sl     = slice(0, EXAMPLE_LENGTH)
 	x_next = ex['target'][1:EXAMPLE_LENGTH + 1].T   # upcoming token x_{t+1}
-	p      = ex['pred'][sl].T                        # prediction p_t
+	p      = ex['pred'][sl].T                        # prediction yhat_{t+1}
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 4.8))
 	gs  = fig.add_gridspec(2, 2, left=0.09, right=0.985, bottom=0.20, top=0.92,
@@ -228,7 +229,7 @@ def fig02_prediction_one_net(fname='fig02_prediction-one-net.pdf'):
 	# A - upcoming chord against the network's prediction
 	axA = fig.add_subplot(gs[0, :])
 	_piano_roll_(axA, p, vmin=0, vmax=1, overlay=x_next)
-	axA.set_title('prediction $p_t$, upcoming chord $x_{t+1}$ outlined',
+	axA.set_title('prediction $\\hat{y}_{t+1}$, upcoming chord $x_{t+1}$ outlined',
 				  fontsize=FONT_SIZE)
 	_panel_label_(axA, 'A')
 
@@ -358,61 +359,67 @@ def fig04_prediction_sweep(fname='fig04_prediction-sweep.pdf'):
 	_save_(fig, fname)
 
 
-def fig05_pe_one_net(fname='fig05_pe-one-net.pdf'):
-	"""Prediction errors drive and inhabit the state, in a single network.
+def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
+	"""Prediction errors drive the state update.
 
-	A  z-scored timecourses of the innovation magnitude and the state-update
-	   magnitude for one test composition (silence-padding frames blanked)
-	B  per-timestep scatter of the two, with the correlation - the
-	   innovation-driven-updating signature of Kalman-style filtering
-	C  decoding the signal innovation x_{t+1} - p_t over the 140 compositions:
-	   constant vs input-only vs hidden-state decoder. The input-only rung is the
-	   critical control: the state necessarily carries the observation it has just
-	   consumed, so only state > input demonstrates encoding beyond input drive
-	D  the same ladder for the expected-but-absent (omission) component, where the
-	   current input holds no trace of the error by construction
+	A  z-scored timecourses of the prediction-error magnitude and the
+	   state-update magnitude, over the same excerpt the other example figures
+	   show (silence-padding frames blanked)
+	B  per-timestep scatter of the two over the whole example composition, with
+	   the correlation - the error-driven-updating signature of Kalman filtering
+	C  the same correlation for every test composition at the exemplar cell, so
+	   B is placed in the distribution it is drawn from rather than standing as
+	   a single case
+	D  the correlation across the sweep (mean per-composition r), showing where
+	   error-driven updating survives noise and capacity
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
+	if not _require_(pe_dict, ['pe_std'], 'pe_results.pickle'):
 		return
 
 	six, nix = _example_indices_(pe_dict)
+	accent   = _model_colors_()['pred_err']
 
-	# Example-network series, computed on the fly (mirrors compute_pe_terms)
+	# Example-network series, computed on the fly (mirrors compute_pe_terms).
+	# Index i is frame t = i+1, so e_t = y_t - yhat_t sits against dh_t = h_t - h_{t-1}
 	ex   = _load_example_model_()
 	pe2  = ((ex['sample'][1:] - ex['pred'][:-1]) ** 2).mean(1)
 	std2 = ((ex['hidden'][1:] - ex['hidden'][:-1]) ** 2).mean(1)
 	mask = ex['target'][1:].sum(1) > 0
 
-	fig = plt.figure(figsize=(FIG_WIDTH, 5.2))
-	gs  = fig.add_gridspec(2, 6, left=0.08, right=0.985, bottom=0.10, top=0.94,
-						   wspace=1.1, hspace=0.45, height_ratios=[0.8, 1])
+	fig = plt.figure(figsize=(FIG_WIDTH, 5.0))
+	gs  = fig.add_gridspec(2, 7, left=0.075, right=0.985, bottom=0.09, top=0.93,
+						   height_ratios=[1, 1.3], wspace=1.5, hspace=0.55)
 
-	# A - the two magnitude timecourses, z-scored over sounding frames; silence
-	# pads between concatenated movements are blanked rather than hidden, so the
-	# gaps mark the movement boundaries
+	# A - the two magnitude timecourses, z-scored over every sounding frame of the
+	# composition and then cropped, so the excerpt is on the composition's own
+	# scale rather than renormalised to whatever the window happens to contain.
+	# Silence pads between concatenated movements are blanked rather than hidden,
+	# so the gaps mark the movement boundaries
 	axA = fig.add_subplot(gs[0, :4])
-	accent = _model_colors_()['pred_err']
-	for series, colour, label in [(pe2, '0.3', 'innovation $||e_t||^2$'),
+	for series, colour, label in [(pe2, '0.3', 'prediction error $||e_t||^2$'),
 								  (std2, accent, 'state update $||\\Delta h_t||^2$')]:
 		z = np.full_like(series, np.nan)
 		z[mask] = (series[mask] - series[mask].mean()) / series[mask].std()
-		axA.plot(z, linewidth=0.6, color=colour, label=label)
-	axA.set_xlim(0, len(pe2))
+		axA.plot(z[:EXAMPLE_LENGTH], linewidth=0.7, color=colour, label=label)
+	axA.set_xlim(0, EXAMPLE_LENGTH)
+	# Headroom for the legend, which sits over the traces at this aspect ratio
+	axA.set_ylim(top=axA.get_ylim()[1] + 1.4)
 	axA.set_xlabel('time step', fontsize=LABEL_SIZE)
 	axA.set_ylabel('z-score', fontsize=LABEL_SIZE)
-	axA.set_title(f'{ex["opera"].upper()} (test set)', fontsize=FONT_SIZE, pad=2)
 	axA.legend(fontsize=FONT_SIZE - 1, frameon=False, loc='upper right', ncol=2,
 			   handlelength=1.2, columnspacing=1.0)
 	_panel_label_(axA, 'A')
 
-	# B - the same two series against each other, one dot per (sounding) step
-	axB = fig.add_subplot(gs[0, 4:])
+	# B - the same two series against each other, one dot per sounding step. The
+	# whole composition is used, not just A's excerpt: the correlation is the
+	# quantity C and D aggregate, so it has to be the per-composition r they store
+	axB = fig.add_subplot(gs[0, 4:6])
 	r, p = ss.pearsonr(pe2[mask], std2[mask])
 	axB.scatter(pe2[mask], std2[mask], s=3, color=accent, alpha=0.4, edgecolor='none')
-	axB.set_xlabel('innovation $||e_t||^2$', fontsize=LABEL_SIZE)
+	axB.set_xlabel('prediction error $||e_t||^2$', fontsize=LABEL_SIZE)
 	axB.set_ylabel('state update $||\\Delta h_t||^2$', fontsize=LABEL_SIZE)
 	# The per-timestep p underflows to zero for any decent correlation over
 	# hundreds of steps; report a floor rather than a meaningless exact value
@@ -420,11 +427,76 @@ def fig05_pe_one_net(fname='fig05_pe-one-net.pdf'):
 	axB.set_title(f'r = {r:.2f} ({p_str})', fontsize=FONT_SIZE, pad=2)
 	_panel_label_(axB, 'B')
 
-	# C, D - decoding ladders at the exemplar cell (single network, run 0)
-	for ax, target, letter, title in [
-			(fig.add_subplot(gs[1, :3]), 'sig', 'C', 'signal innovation  $x_{t+1} - p_t$'),
-			(fig.add_subplot(gs[1, 3:]), 'neg', 'D', 'omissions  $(p_t - x_{t+1})_+$')]:
+	# C - B's correlation for all 140 test compositions of the same network. White
+	# body against the accent outline: the panel is the population B is one sample
+	# of, so it should not read as a third data series
+	axC = fig.add_subplot(gs[0, 6])
+	rs  = _get_cell_(pe_dict, 'pe_std', six, nix, run=EXAMPLE_RUN)
+	rs  = rs[np.isfinite(rs)]
+	parts = axC.violinplot([rs], positions=[0], showextrema=False, widths=0.9)
+	parts['bodies'][0].set_facecolor('white')
+	parts['bodies'][0].set_edgecolor(accent)
+	parts['bodies'][0].set_linewidth(0.8)
+	parts['bodies'][0].set_alpha(1.0)
+	axC.axhline(0, color='0.6', linewidth=0.6, linestyle='--', zorder=0)
+	# One-sample d and Wilcoxon against zero, on the same 140 compositions
+	cohens_d, p_val = _compute_stats_(rs)
+	p_txt = f'p = {p_val:.1g}' if p_val > 1e-10 else 'p < 1e-10'
+	lo, hi = axC.get_ylim()
+	axC.set_ylim(lo, hi + 0.42 * (hi - lo))
+	axC.text(0, hi + 0.20 * (hi - lo), f'd = {cohens_d:.1f}\n{p_txt}',
+			 fontsize=FONT_SIZE - 1, ha='center', va='center')
+	axC.set_xticks([])
+	axC.set_xlim(-0.7, 0.7)
+	axC.set_ylabel('r per composition', fontsize=LABEL_SIZE)
+	_panel_label_(axC, 'C')
 
+	# D - error-driven updating across the design
+	axD = fig.add_subplot(gs[1, :])
+	vals, annot = _pe_corr_map_(pe_dict)
+	_heatmap_(axD, vals, annot, vmax=1.0, noise_vals=pe_dict['noise'],
+			  n_hidden_vals=pe_dict['n_hidden'], cbar_label='mean r')
+	axD.set_title('prediction-error-driven state updating: corr(||e||², ||Δh||²)',
+				  fontsize=FONT_SIZE, pad=3)
+	_panel_label_(axD, 'D')
+
+	_save_(fig, fname)
+
+
+def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
+	"""The prediction error is decodable from the state, beyond input drive.
+
+	A  decoding the signal prediction error x_t - yhat_t over the 140
+	   compositions of the exemplar cell: constant vs input-only vs hidden-state
+	   decoder. The input-only rung is the critical control: the state
+	   necessarily carries the observation it has just consumed, so only
+	   state > input demonstrates encoding beyond input drive
+	B  the same ladder for the expected-but-absent (omission) component, where
+	   the current input holds no trace of the error by construction
+	C  the state decoder's advantage over the input-only control for the signal
+	   prediction error across the sweep (Cohen's d of the paired MSE
+	   difference; warm = state better)
+	D  the same for the omission component
+	"""
+	_set_plos_style_()
+
+	pe_dict = _load_pe_results_()
+	if not _require_(pe_dict, PE_DECODING_KEYS, 'pe_results.pickle'):
+		return
+
+	six, nix = _example_indices_(pe_dict)
+	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 7.0))
+	gs  = fig.add_gridspec(3, 2, left=0.085, right=0.985, bottom=0.07, top=0.94,
+						   height_ratios=[1.15, 1, 1], wspace=0.3, hspace=0.55)
+
+	# A, B - decoding ladders at the exemplar cell (single network, run 0)
+	for col, target, letter, title in [
+			(0, 'sig', 'A', 'signal prediction error  $x_t - \\hat{y}_t$'),
+			(1, 'neg', 'B', 'omissions  $(\\hat{y}_t - x_t)_+$')]:
+
+		ax = fig.add_subplot(gs[0, col])
 		# cols holds log MSE, so the bracket reports the log-scale effect size
 		cols = _decoding_violins_(ax, pe_dict, target, six, nix, run=EXAMPLE_RUN)
 		lo   = min(np.nanmin(v) for v in cols.values())
@@ -434,47 +506,14 @@ def fig05_pe_one_net(fname='fig05_pe-one-net.pdf'):
 		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
 		_panel_label_(ax, letter)
 
-	_save_(fig, fname)
-
-
-def fig06_pe_sweep(fname='fig06_pe-sweep.pdf'):
-	"""Prediction-error encoding across the sweep.
-
-	A  heatmap of the innovation / state-update correlation (mean per-composition
-	   r, run-averaged), the Kalman-signature panel
-	B  heatmap of the state decoder's advantage over the input-only control for
-	   the signal innovation (Cohen's d of the paired MSE difference; warm =
-	   state better)
-	C  the same for the omission component
-	"""
-	_set_plos_style_()
-
-	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
-		return
-
-	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
-
-	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
-	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
-						   hspace=0.5)
-
-	# A - innovation-driven updating across the design
-	axA = fig.add_subplot(gs[0])
-	vals, annot = _pe_corr_map_(pe_dict)
-	_heatmap_(axA, vals, annot, vmax=1.0, noise_vals=noise, n_hidden_vals=n_hidden,
-			  cbar_label='mean r')
-	axA.set_title('innovation-driven state updating: corr(||e||², ||Δh||²)',
-				  fontsize=FONT_SIZE, pad=3)
-	_panel_label_(axA, 'A')
-
-	# B, C - decoding beyond input drive: paired Cohen's d of input-only minus
-	# state MSE (positive = state better), run-averaged per composition
+	# C, D - decoding beyond input drive across the design: paired Cohen's d of
+	# input-only minus state MSE (positive = state better), run-averaged per
+	# composition
 	for row, target, letter, title in [
-			(1, 'sig', 'B', 'signal innovation: state decoder vs input-only'),
-			(2, 'neg', 'C', 'omissions: state decoder vs input-only')]:
+			(1, 'sig', 'C', 'signal prediction error: state decoder vs input-only'),
+			(2, 'neg', 'D', 'omissions: state decoder vs input-only')]:
 
-		ax = fig.add_subplot(gs[row])
+		ax = fig.add_subplot(gs[row, :])
 		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_y', f'dec_{target}_h',
 								   plot_cohen=True, log=True)
 		_heatmap_(ax, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
@@ -709,9 +748,9 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	The composition stays the unit of analysis (n = 140); each quantity is
 	computed independently within every run at the exemplar cell.
 
-	A  per-run violins of the innovation / state-update correlation
+	A  per-run violins of the prediction-error / state-update correlation
 	B  forest of Cohen's d, input-only minus state decoding MSE (signal
-	   innovation), one row per run; right of zero = state better
+	   prediction error), one row per run; right of zero = state better
 	C  the same for the omission component
 	"""
 	_set_plos_style_()
@@ -743,7 +782,7 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	_panel_label_(axs[0], 'A')
 
 	# B, C - the decoding contrast per run: d of paired input-only minus state MSE
-	for ax, target, letter, title in [(axs[1], 'sig', 'B', 'signal innovation'),
+	for ax, target, letter, title in [(axs[1], 'sig', 'B', 'signal prediction error'),
 									  (axs[2], 'neg', 'C', 'omissions')]:
 		# Log MSE, matching Fig 6: the raw scale is heavy-tailed across
 		# compositions and understates a consistent effect (see _sweep_maps_)

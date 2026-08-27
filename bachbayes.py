@@ -337,21 +337,23 @@ class Bachmodel():
 		"""Per-timestep quantities for the prediction-error analyses.
 
 		Every series is aligned on the predicted frame: index i refers to frame
-		t+1 = i+1, predicted from the state after frame t = i. Returned keys:
+		t = i+1, whose prediction yhat_t was formed from the state h_{t-1} after
+		frame t-1 = i. A hatted symbol estimates the quantity of the same index,
+		so yhat_t is the prediction of y_t. Returned keys:
 
-		  pe_raw  y_{t+1} - p_t: the network-visible innovation; its magnitude
-		          scales with the noise parameter
-		  pe_sig  x_{t+1} - p_t: the signal innovation. The raw error also
+		  pe_raw  y_t - yhat_t: the network-visible prediction error; its
+		          magnitude scales with the noise parameter
+		  pe_sig  x_t - yhat_t: the signal prediction error. The raw error also
 		          contains the observation noise, which the state trivially
-		          carries because it has just consumed y_{t+1}; the signal part
+		          carries because it has just consumed y_t; the signal part
 		          is the component whose encoding is informative
-		  pe_neg  max(p_t - x_{t+1}, 0): the expected-but-absent component
+		  pe_neg  max(yhat_t - x_t, 0): the expected-but-absent component
 		          (omissions). At an omission the input holds no trace of the
 		          error, so this part cannot be reconstructed from the current
 		          observation alone - the model analogue of omission responses
-		  y_next  y_{t+1}, the features of the input-only control decoder
-		  stm     h_{t+1}; std  h_{t+1} - h_t
-		  mask    frames where x_{t+1} contains any active pitch class. False
+		  y_next  y_t, the features of the input-only control decoder
+		  stm     h_t;  std  dh_t = h_t - h_{t-1}
+		  mask    frames where x_t contains any active pitch class. False
 		          on the silence padding inserted between concatenated
 		          movements, which otherwise couples all series spuriously
 		"""
