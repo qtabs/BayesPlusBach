@@ -21,8 +21,8 @@ N_REF         = 256  # reference models are capacity-saturated (max of the sweep
 ## PE analysis
 # 'raw' == innovation; 'sig' == signal component; 'neg' == omission component
 PE_TARGETS  = ['raw', 'sig', 'neg']
-# Control ladder: 'b' == constant decoder; 'x' == observation; 'h' == hidden state
-PE_DECODERS = ['b', 'x', 'h']
+# Control ladder: 'b' == constant decoder; 'y' == observation; 'h' == hidden state
+PE_DECODERS = ['b', 'y', 'h']
 
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
@@ -190,7 +190,7 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 			m.save_weights(suffix)
 			print(f' done! Time = {(time.time() - t0)/60:.1f} minutes')
 
-	# Observations high bound: memoryless logistic decoder (x_t -> y_t)
+	# Observations high bound: memoryless logistic decoder (y_t -> x_t)
 	obs_high = logistic_ref('observations high bound', '_observation-high', obj=['obs'])
 
 	# Predictions high bound: global distribution (marginal predictor)
@@ -200,10 +200,10 @@ def baselines(noise, n_hidden=N_REF, only_testing=False):
 	print()
 	del gd
 
-	# Predictions Markov high bound: logistic 1-step from noisy input (x_t -> y_{t+1})
+	# Predictions Markov high bound: logistic 1-step from noisy input (y_t -> x_{t+1})
 	pred_markh = logistic_ref('predictions markov high bound', '_prediction-markov-high', obj=['pred'])
 
-	# Predictions Markov low bound: logistic 1-step from clean input (y_t -> y_{t+1})
+	# Predictions Markov low bound: logistic 1-step from clean input (x_t -> x_{t+1})
 	pred_markl = logistic_ref('predictions markov low bound', '_prediction-markov-low',
 							  obj=['pred'], target_as_input=True)
 
@@ -363,14 +363,14 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 				m.load_weights(f'_prediction_run{run_n:02d}')
 
 				# B. Fit the decoders on the validation split (silence masked). 
-				feats = {'x': [], 'h': []}
+				feats = {'y': [], 'h': []}
 				targs = {t: [] for t in PE_TARGETS}
 
 				for opera in sorted(val_chunker.song_pool):
 					song  = val_chunker.read_song_as_tensor(opera)
 					terms = m.compute_pe_terms(song['sample'], song['target'])
 					mk    = terms['mask']
-					feats['x'].append(terms['x_next'][mk])
+					feats['y'].append(terms['y_next'][mk])
 					feats['h'].append(terms['stm'][mk])
 					for t in PE_TARGETS:
 						targs[t].append(terms[f'pe_{t}'][mk])
@@ -382,7 +382,7 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 				stacked  = np.hstack([targs[t] for t in PE_TARGETS])
 				reg      = {d: RidgeCV(alphas=np.logspace(-3, 3, 7), alpha_per_target=True)
 							   .fit(feats[d], stacked)
-							for d in ['x', 'h']}
+							for d in ['y', 'h']}
 				cols     = {t: slice(k * width, (k + 1) * width)
 							for k, t in enumerate(PE_TARGETS)}
 				constant = {t: targs[t].mean(0) for t in PE_TARGETS}
@@ -400,13 +400,13 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 					std2 = (terms['std'][mk] ** 2).mean(1)
 					results['pe_std'][six, nix, run_n, nop] = ss.pearsonr(pe2, std2)[0]
 
-					hat = {d: reg[d].predict(terms['x_next' if d == 'x' else 'stm'][mk])
-						   for d in ['x', 'h']}
+					hat = {d: reg[d].predict(terms['y_next' if d == 'y' else 'stm'][mk])
+						   for d in ['y', 'h']}
 
 					for t in PE_TARGETS:
 						truth = terms[f'pe_{t}'][mk]
 						preds = {'b': constant[t],
-								 'x': hat['x'][:, cols[t]],
+								 'y': hat['y'][:, cols[t]],
 								 'h': hat['h'][:, cols[t]]}
 						for d in PE_DECODERS:
 							results[f'dec_{t}_{d}'][six, nix, run_n, nop] = \

@@ -123,11 +123,11 @@ DECODING_LADDER   = ['obs_err', 'obs_high']
 # Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
 # dec_<target>_<decoder>, with targets raw (y_{t+1} - p_t), sig (x_{t+1} - p_t)
 # and neg (the expected-but-absent omission component), and the control ladder
-# b (constant) / x (input-only) / h (hidden state). Encoding beyond input drive
-# requires h to beat x, since the state necessarily carries the observation it
+# b (constant) / y (input-only) / h (hidden state). Encoding beyond input drive
+# requires h to beat y, since the state necessarily carries the observation it
 # has just consumed
-PE_DECODING_KEYS  = [f'dec_{t}_{d}' for t in ('raw', 'sig', 'neg') for d in ('b', 'x', 'h')]
-PE_DECODER_LABELS = {'b': 'constant', 'x': 'input only', 'h': 'hidden state'}
+PE_DECODING_KEYS  = [f'dec_{t}_{d}' for t in ('raw', 'sig', 'neg') for d in ('b', 'y', 'h')]
+PE_DECODER_LABELS = {'b': 'constant', 'y': 'input only', 'h': 'hidden state'}
 
 
 # Main figures
@@ -430,7 +430,7 @@ def fig05_pe_one_net(fname='fig05_pe-one-net.pdf'):
 		lo   = min(np.nanmin(v) for v in cols.values())
 		hi   = max(np.nanmax(v) for v in cols.values())
 		ax.set_ylim(lo - 0.15 * (hi - lo), hi + 0.55 * (hi - lo))
-		_write_stats_pair_(ax, cols, 'x', 'h', x0=1, x1=2, y=hi + 0.12 * (hi - lo))
+		_write_stats_pair_(ax, cols, 'y', 'h', x0=1, x1=2, y=hi + 0.12 * (hi - lo))
 		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
 		_panel_label_(ax, letter)
 
@@ -475,7 +475,7 @@ def fig06_pe_sweep(fname='fig06_pe-sweep.pdf'):
 			(2, 'neg', 'C', 'omissions: state decoder vs input-only')]:
 
 		ax = fig.add_subplot(gs[row])
-		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_x', f'dec_{target}_h',
+		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_y', f'dec_{target}_h',
 								   plot_cohen=True, log=True)
 		_heatmap_(ax, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
 				  cbar_label="Cohen's d (log MSE)")
@@ -749,12 +749,12 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 		# compositions and understates a consistent effect (see _sweep_maps_)
 		effects, intervals = [], []
 		for r in runs:
-			x = pe_dict[f'dec_{target}_x'][six, nix, r]
+			y = pe_dict[f'dec_{target}_y'][six, nix, r]
 			h = pe_dict[f'dec_{target}_h'][six, nix, r]
-			ok = np.isfinite(x) & np.isfinite(h) & (x > 0) & (h > 0)
-			lx, lh = np.log(x[ok]), np.log(h[ok])
-			effects.append(_compute_stats_(lx, lh)[0])
-			intervals.append(_bootstrap_ci_(lx, lh))
+			ok = np.isfinite(y) & np.isfinite(h) & (y > 0) & (h > 0)
+			ly, lh = np.log(y[ok]), np.log(h[ok])
+			effects.append(_compute_stats_(ly, lh)[0])
+			intervals.append(_bootstrap_ci_(ly, lh))
 		_forest_plot_(ax, effects, intervals, [f'run {r + 1}' for r in runs])
 		ax.set_xlabel("Cohen's d (log MSE, input $-$ state)", fontsize=LABEL_SIZE)
 		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
@@ -1226,9 +1226,9 @@ def _decoding_violins_(ax, pe_dict, target, six, nix, run=None):
 	accent, its controls grey. Returns {decoder: per-composition array}, jointly
 	NaN-filtered so the arrays stay paired for the stats brackets.
 	"""
-	greys  = {'b': '#9e9e9e', 'x': '#4d4d4d'}
+	greys  = {'b': '#9e9e9e', 'y': '#4d4d4d'}
 	accent = _model_colors_()['pred_err']
-	order  = ['b', 'x', 'h']
+	order  = ['b', 'y', 'h']
 
 	arrays = {d: _get_cell_(pe_dict, f'dec_{target}_{d}', six, nix, run=run)
 			  for d in order}

@@ -339,19 +339,19 @@ class Bachmodel():
 		Every series is aligned on the predicted frame: index i refers to frame
 		t+1 = i+1, predicted from the state after frame t = i. Returned keys:
 
-		  pe_raw  x_{t+1} - p_t: the network-visible innovation; its magnitude
+		  pe_raw  y_{t+1} - p_t: the network-visible innovation; its magnitude
 		          scales with the noise parameter
-		  pe_sig  y_{t+1} - p_t: the signal innovation. The raw error also
+		  pe_sig  x_{t+1} - p_t: the signal innovation. The raw error also
 		          contains the observation noise, which the state trivially
-		          carries because it has just consumed x_{t+1}; the signal part
+		          carries because it has just consumed y_{t+1}; the signal part
 		          is the component whose encoding is informative
-		  pe_neg  max(p_t - y_{t+1}, 0): the expected-but-absent component
+		  pe_neg  max(p_t - x_{t+1}, 0): the expected-but-absent component
 		          (omissions). At an omission the input holds no trace of the
 		          error, so this part cannot be reconstructed from the current
 		          observation alone - the model analogue of omission responses
-		  x_next  x_{t+1}, the features of the input-only control decoder
+		  y_next  y_{t+1}, the features of the input-only control decoder
 		  stm     h_{t+1}; std  h_{t+1} - h_t
-		  mask    frames where y_{t+1} contains any active pitch class. False
+		  mask    frames where x_{t+1} contains any active pitch class. False
 		          on the silence padding inserted between concatenated
 		          movements, which otherwise couples all series spuriously
 		"""
@@ -366,16 +366,16 @@ class Bachmodel():
 			target = target.cpu().detach().numpy()
 
 		p      = pred[0, :-1]
-		x_next = sample[0, 1:]
-		y_next = target[0, 1:]
+		y_next = sample[0, 1:]
+		x_next = target[0, 1:]
 
-		return {'pe_raw': x_next - p,
-				'pe_sig': y_next - p,
-				'pe_neg': np.maximum(p - y_next, 0),
-				'x_next': x_next,
+		return {'pe_raw': y_next - p,
+				'pe_sig': x_next - p,
+				'pe_neg': np.maximum(p - x_next, 0),
+				'y_next': y_next,
 				'stm'   : hidden[0, 1:],
 				'std'   : hidden[0, 1:] - hidden[0, :-1],
-				'mask'  : y_next.sum(1) > 0}
+				'mask'  : x_next.sum(1) > 0}
 
 	def test_globaldist_model(self):
 		
@@ -446,9 +446,9 @@ class LogisticModel():
 
 	Which quantity it estimates is set, exactly as for Bachmodel, by ``obj`` and
 	``target_as_input``:
-	  obj=['obs']                      x_t   -> y_t       (memoryless decoder)
-	  obj=['pred']                     x_t   -> y_{t+1}   (Markov, noisy input)
-	  obj=['pred'], target_as_input    y_t   -> y_{t+1}   (Markov, clean input)
+	  obj=['obs']                      y_t   -> x_t       (memoryless decoder)
+	  obj=['pred']                     y_t   -> x_{t+1}   (Markov, noisy input)
+	  obj=['pred'], target_as_input    x_t   -> x_{t+1}   (Markov, clean input)
 
 	The public interface mirrors the parts of Bachmodel that pipeline.baselines()
 	uses (fit/test/save_weights/load_weights/trained_weights_exists), so the
