@@ -21,8 +21,32 @@ N_REF         = 256  # reference models are capacity-saturated (max of the sweep
 ## PE analysis
 # 'raw' == prediction error; 'sig' == signal component; 'neg' == omission component
 PE_TARGETS  = ['raw', 'sig', 'neg']
-# Control ladder: 'b' == constant decoder; 'y' == observation; 'h' == hidden state
-PE_DECODERS = ['b', 'y', 'h']
+# Control ladder, in order of the information available to each decoder:
+#   'b'  constant (the training-set mean error vector)
+#   'y'  the observation just consumed
+#   'yy' that observation and the one before it - the control that separates coding
+#        a prediction error from remembering the previous chord, since the signal
+#        error is close to x_t - x_{t-1}
+#   'h'  the hidden state
+PE_DECODERS = ['b', 'y', 'yy', 'h']
+# Correlations written per composition:
+#   pe_std     corr(||e||^2,        ||dh||^2)   the raw coupling
+#   pe_ctl_d   corr(||y - xbar||^2, ||dh||^2)   input drive, no temporal prediction
+#   pe_ctl_e   corr(||e||^2,        ||y - xbar||^2)
+#   pe_sig_std corr(||x_t - xhat||^2, ||dh||^2) the signal error, noise excluded
+#   dx_std     corr(||x_t - x_t-1||^2, ||dh||^2) how much of the update is just the
+#              stimulus change - 0.98 where denoising is easy
+#   pe_sig_dx  corr(||x_t - xhat||^2, ||x_t - x_t-1||^2)
+# The last three compose the partial correlation that Fig 5 reports. Ingredients are
+# stored rather than the partial itself, so the formula can change without a re-run
+PE_CORR_METRICS = ['pe_std', 'pe_ctl_d', 'pe_ctl_e', 'pe_sig_std', 'dx_std', 'pe_sig_dx']
+# Measured on the untrained twin as well (a subset: the twin predates the rest)
+PE_UNT_METRICS  = ['pe_std', 'pe_ctl_d', 'pe_ctl_e']
+# Which decoders are written together, and the metric standing for each group's
+# completion. Splitting them lets a new rung be added without refitting the old ones
+PE_DECODER_GROUPS  = {'dec': ['b', 'y', 'h'], 'dec_lag': ['yy']}
+PE_GROUP_SENTINELS = {'corr': 'pe_sig_std', 'unt': 'pe_std_unt',
+					  'dec' : 'dec_sig_h',  'dec_lag': 'dec_sig_yy'}
 
 
 def prepare_data(test_rat=0.2, validation_rat=0.1, basedir='.'):
@@ -322,22 +346,74 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 	n_hidden_vals = savedict['n_hidden']
 	operas        = sorted(bachbayes.Chunker('./test', 1, None, True, 0, seed=bachbayes.EVAL_SEED).song_pool)
 
-	# Per-composition metrics, all (noise, n_hidden, run, opera): the correlation
-	# between prediction-error magnitude and state-update magnitude, plus the decoding
-	# MSE for every target x decoder pair of the ladder
-	metric_names = ['pe_std'] + [f'dec_{t}_{d}' for t in PE_TARGETS for d in PE_DECODERS]
+	# Per-composition metrics, all (noise, n_hidden, run, opera), in four groups that
+	# are resumed independently (see the completion checks below), so a measurement
+	# can be added to a finished sweep without paying for the rest of it again
+	metric_names = (PE_CORR_METRICS
+					+ [f'{k}_unt' for k in PE_UNT_METRICS]
+					+ [f'dec_{t}_{d}' for t in PE_TARGETS for d in PE_DECODERS])
 	shape        = (len(noise_vals), len(n_hidden_vals), n_runs, len(operas))
 
 	# Resume from an existing pickle if it matches the design; completed cells are
-	# skipped, so the sweep can be interrupted and relaunched
+	# skipped, so the sweep can be interrupted and relaunched. The design guard is
+	# on the axes alone: a metric the stored file has never seen is backfilled with
+	# NaN rather than treated as a mismatch
 	if os.path.exists(pe_path):
 		with open(pe_path, 'rb') as f:
 			results = pickle.load(f)
-		if results.get('noise') != noise_vals or results['pe_std'].shape != shape:
+		if (results.get('noise') != noise_vals
+				or results.get('n_hidden') != n_hidden_vals
+				or results['pe_std'].shape != shape):
 			raise ValueError(f'{pe_path} was produced under a different design; archive it first')
+		for name in metric_names:
+			results.setdefault(name, np.full(shape, np.nan))
 	else:
 		results = {name: np.full(shape, np.nan) for name in metric_names}
-		results.update({'noise': noise_vals, 'n_hidden': n_hidden_vals, 'n_runs': n_runs})
+
+	results.update({'noise': noise_vals, 'n_hidden': n_hidden_vals, 'n_runs': n_runs})
+
+	# The constant predictor pe_ctl_* is referred to: the training-set marginal, i.e.
+	# the global-distribution rung of the ladder. It reads the clean targets only, so
+	# it is noise-independent and computed once for the whole sweep
+	ref_pars  = {'datapath': '.', 'chromatic': True, 'noise': noise_vals[0],
+				 'n_layers': 1, 'n_hidden': n_hidden_vals[0], 'mod_type': 'gru'}
+	glob_dist = bachbayes.Bachmodel(ref_pars).global_distribution().cpu().numpy()
+
+	def correlation_terms(terms):
+		"""Every correlation of one composition, keyed by metric name.
+
+		dx_std and pe_sig_dx exist because the headline correlation is confounded
+		by stimulus change: when denoising is easy the state update simply follows
+		x_t - x_{t-1}, and a persistence-like prediction makes the signal error the
+		same quantity. The partial correlation composed from pe_sig_std, dx_std and
+		pe_sig_dx is what actually measures error-driven updating.
+		"""
+		mk   = terms['mask']
+		pe2  = (terms['pe_raw'][mk] ** 2).mean(1)
+		sig2 = (terms['pe_sig'][mk] ** 2).mean(1)
+		std2 = (terms['std'][mk] ** 2).mean(1)
+		dx2  = (terms['dx'][mk] ** 2).mean(1)
+		ctl2 = ((terms['y_next'][mk] - glob_dist) ** 2).mean(1)
+		r    = lambda a, b: ss.pearsonr(a, b)[0]
+
+		return {'pe_std'    : r(pe2,  std2),
+				'pe_ctl_d'  : r(ctl2, std2),
+				'pe_ctl_e'  : r(pe2,  ctl2),
+				'pe_sig_std': r(sig2, std2),
+				'dx_std'    : r(dx2,  std2),
+				'pe_sig_dx' : r(sig2, dx2)}
+
+	def decoder_features(terms):
+		"""Feature matrix per decoder of the control ladder, in ladder order.
+
+		'yy' is the input-plus-previous control. The state carries the observation
+		it has just consumed *and* the one before it, and the signal error is close
+		to x_t - x_{t-1}, so a state decoder beating 'y' alone could simply be
+		remembering the previous chord. Only state > 'yy' isolates prediction
+		"""
+		return {'y' : terms['y_next'],
+				'yy': np.hstack([terms['y_next'], terms['y_prev']]),
+				'h' : terms['stm']}
 
 	for six, noise in enumerate(noise_vals):
 
@@ -349,45 +425,70 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 		for nix, n_hidden in enumerate(n_hidden_vals):
 			for run_n in range(n_runs):
 
-				if np.isfinite(results['dec_sig_h'][six, nix, run_n]).any():
+				# Resumed per group, not per cell. Each group is represented by one
+				# metric: if that one is present the whole group was written together
+				done = {g: np.isfinite(results[k][six, nix, run_n]).any()
+						for g, k in PE_GROUP_SENTINELS.items()}
+
+				if all(done.values()):
 					continue
 
-				t0 = time.time()
-				print(f'Computing PE for (noise={noise:g}, n={n_hidden}, run {run_n})...', end='')
+				t0   = time.time()
+				todo = ' + '.join(g for g in PE_GROUP_SENTINELS if not done[g])
+				print(f'Computing PE ({todo}) for (noise={noise:g}, n={n_hidden}, run {run_n})...', end='')
 
-				# A. Load the denoising-trained network with its prediction probe
+				# A. Load the denoising-trained network with its prediction probe,
+				# plus - for the untrained control - a twin of it at random weights.
+				# The run index doubles as the twin's seed, so the five runs give
+				# five independent initialisations rather than one repeated
 				pars = {'datapath': '.', 'chromatic': True, 'noise': noise,
 						'n_layers': 1, 'n_hidden': n_hidden, 'mod_type': 'gru'}
 
 				m = bachbayes.Bachmodel(pars)
 				m.load_weights(f'_prediction_run{run_n:02d}')
 
-				# B. Fit the decoders on the validation split (silence masked). 
-				feats = {'y': [], 'h': []}
-				targs = {t: [] for t in PE_TARGETS}
+				if not done['unt']:
+					torch.manual_seed(run_n)
+					untrained = bachbayes.Bachmodel(pars)
 
-				for opera in sorted(val_chunker.song_pool):
-					song  = val_chunker.read_song_as_tensor(opera)
-					terms = m.compute_pe_terms(song['sample'], song['target'])
-					mk    = terms['mask']
-					feats['y'].append(terms['y_next'][mk])
-					feats['h'].append(terms['stm'][mk])
-					for t in PE_TARGETS:
-						targs[t].append(terms[f'pe_{t}'][mk])
+				# B. Fit whichever decoders the missing groups need, on the
+				# validation split (silence masked). A group that is already stored
+				# costs nothing here, so adding the 'yy' rung to a finished ladder
+				# fits that rung alone
+				need_fit   = [d for g in PE_DECODER_GROUPS if not done[g]
+							  for d in PE_DECODER_GROUPS[g] if d != 'b']
+				need_const = any(not done[g] for g in PE_DECODER_GROUPS
+								 if 'b' in PE_DECODER_GROUPS[g])
 
-				feats = {k: np.concatenate(v) for k, v in feats.items()}
-				targs = {k: np.concatenate(v) for k, v in targs.items()}
+				if need_fit or need_const:
+					feats = {d: [] for d in need_fit}
+					targs = {t: [] for t in PE_TARGETS}
 
-				width    = targs[PE_TARGETS[0]].shape[1]
-				stacked  = np.hstack([targs[t] for t in PE_TARGETS])
-				reg      = {d: RidgeCV(alphas=np.logspace(-3, 3, 7), alpha_per_target=True)
-							   .fit(feats[d], stacked)
-							for d in ['y', 'h']}
-				cols     = {t: slice(k * width, (k + 1) * width)
-							for k, t in enumerate(PE_TARGETS)}
-				constant = {t: targs[t].mean(0) for t in PE_TARGETS}
+					for opera in sorted(val_chunker.song_pool):
+						song  = val_chunker.read_song_as_tensor(opera)
+						terms = m.compute_pe_terms(song['sample'], song['target'])
+						mk    = terms['mask']
+						cols_ = decoder_features(terms)
+						for d in need_fit:
+							feats[d].append(cols_[d][mk])
+						for t in PE_TARGETS:
+							targs[t].append(terms[f'pe_{t}'][mk])
+
+					feats = {k: np.concatenate(v) for k, v in feats.items()}
+					targs = {k: np.concatenate(v) for k, v in targs.items()}
+
+					width    = targs[PE_TARGETS[0]].shape[1]
+					stacked  = np.hstack([targs[t] for t in PE_TARGETS])
+					reg      = {d: RidgeCV(alphas=np.logspace(-3, 3, 7), alpha_per_target=True)
+								   .fit(feats[d], stacked)
+								for d in need_fit}
+					cols     = {t: slice(k * width, (k + 1) * width)
+								for k, t in enumerate(PE_TARGETS)}
+					constant = {t: targs[t].mean(0) for t in PE_TARGETS} if need_const else {}
 
 				# C. Evaluate on the test set, one value per composition
+				drift = 0.0
+
 				for nop, opera in enumerate(operas):
 
 					song  = test_chunker.read_song_as_tensor(opera)
@@ -396,27 +497,48 @@ def prediction_error_analysis_pipeline(n_runs=N_RUNS_TRAIN, pe_path='./results/p
 					if mk.sum() < 10:
 						continue
 
-					pe2  = (terms['pe_raw'][mk] ** 2).mean(1)
-					std2 = (terms['std'][mk] ** 2).mean(1)
-					results['pe_std'][six, nix, run_n, nop] = ss.pearsonr(pe2, std2)[0]
+					if not done['corr']:
+						# pe_std is recomputed here even though the stored sweep
+						# already holds it: the squared series are needed for the
+						# controls anyway, and the disagreement reported at the end
+						# of the cell checks that the archived pickle still matches
+						# the code reading it. The stored value is kept, never
+						# overwritten, so an archived sweep stays bit-identical
+						values = correlation_terms(terms)
+						stored = results['pe_std'][six, nix, run_n, nop]
+						if np.isfinite(stored):
+							drift = max(drift, abs(stored - values['pe_std']))
+							values['pe_std'] = stored
+						for key in PE_CORR_METRICS:
+							results[key][six, nix, run_n, nop] = values[key]
 
-					hat = {d: reg[d].predict(terms['y_next' if d == 'y' else 'stm'][mk])
-						   for d in ['y', 'h']}
+					if not done['unt']:
+						un = correlation_terms(untrained.compute_pe_terms(song['sample'], song['target']))
+						for key in PE_UNT_METRICS:
+							results[f'{key}_unt'][six, nix, run_n, nop] = un[key]
 
-					for t in PE_TARGETS:
-						truth = terms[f'pe_{t}'][mk]
-						preds = {'b': constant[t],
-								 'y': hat['y'][:, cols[t]],
-								 'h': hat['h'][:, cols[t]]}
-						for d in PE_DECODERS:
-							results[f'dec_{t}_{d}'][six, nix, run_n, nop] = \
-								((truth - preds[d]) ** 2).mean()
+					if need_fit or need_const:
+						cols_ = decoder_features(terms)
+						hat   = {d: reg[d].predict(cols_[d][mk]) for d in need_fit}
+
+						for g, decoders in PE_DECODER_GROUPS.items():
+							if done[g]:
+								continue
+							for t in PE_TARGETS:
+								truth = terms[f'pe_{t}'][mk]
+								for d in decoders:
+									pred = constant[t] if d == 'b' else hat[d][:, cols[t]]
+									results[f'dec_{t}_{d}'][six, nix, run_n, nop] = \
+										((truth - pred) ** 2).mean()
 
 				# Incremental save: a completed cell survives an interruption
 				with open(pe_path, 'wb') as f:
 					pickle.dump(results, f)
 
-				print(f' done! Time = {(time.time()-t0)/60:.2f}m')
+				# float32 differences between a CUDA and a CPU forward pass move r by
+				# ~1e-6, so only report a disagreement large enough to mean something
+				drift_msg = f', pe_std drift {drift:.2g}' if drift > 5e-06 else ''
+				print(f' done! Time = {(time.time()-t0)/60:.2f}m{drift_msg}')
 
 
 def load_results(results_path='./results/results.pickle'):

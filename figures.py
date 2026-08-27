@@ -123,11 +123,21 @@ DECODING_LADDER   = ['obs_err', 'obs_high']
 # Prediction-error decoding metrics stored by prediction_error_analysis_pipeline:
 # dec_<target>_<decoder>, with targets raw (y_t - xhat_{t|t-1}), sig (x_t - xhat_{t|t-1})
 # and neg (the expected-but-absent omission component), and the control ladder
-# b (constant) / y (input-only) / h (hidden state). Encoding beyond input drive
-# requires h to beat y, since the state necessarily carries the observation it
-# has just consumed
-PE_DECODING_KEYS  = [f'dec_{t}_{d}' for t in ('raw', 'sig', 'neg') for d in ('b', 'y', 'h')]
-PE_DECODER_LABELS = {'b': 'constant', 'y': 'input only', 'h': 'hidden state'}
+# b (constant) / y (input-only) / yy (input plus the previous observation) /
+# h (hidden state). Encoding beyond input drive requires h to beat y, since the
+# state necessarily carries the observation it has just consumed - and beyond
+# memory, h must beat yy too, because the signal error is close to x_t - x_{t-1}
+# and so is reconstructible from the last two observations without predicting
+PE_DECODING_KEYS  = [f'dec_{t}_{d}' for t in ('raw', 'sig', 'neg')
+					 for d in ('b', 'y', 'yy', 'h')]
+PE_DECODER_LABELS = {'b': 'constant', 'y': 'input only',
+					 'yy': 'input + previous', 'h': 'hidden state'}
+
+# The three correlations Fig 5 composes into a partial. The raw coupling cannot
+# separate error-driven updating from the stimulus simply changing, so the main-text
+# map is the partial; the uncontrolled map, the confound itself and the untrained
+# twin live in Fig S5
+PE_CORR_KEYS      = ['pe_sig_std', 'dx_std', 'pe_sig_dx']
 
 
 # Main figures
@@ -360,106 +370,93 @@ def fig04_prediction_sweep(fname='fig04_prediction-sweep.pdf'):
 
 
 def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
-	"""Prediction errors drive the state update.
+	"""Prediction errors drive the state update, once stimulus change is controlled.
 
-	A  z-scored timecourses of the prediction-error magnitude and the
-	   state-update magnitude, over the same excerpt the other example figures
-	   show (silence-padding frames blanked)
-	B  per-timestep scatter of the two over the whole example composition, with
-	   the correlation - the error-driven-updating signature of Kalman filtering
-	C  the same correlation for every test composition at the exemplar cell, so
-	   B is placed in the distribution it is drawn from rather than standing as
-	   a single case
-	D  the correlation across the sweep (mean per-composition r), showing where
-	   error-driven updating survives noise and capacity
+	A  per-timestep scatter for the example composition: the state update on x,
+	   against both the signal prediction error and the stimulus change on y. The
+	   two compete directly, because when denoising is easy they are the same
+	   quantity - the probe's prediction is close to persistence, so the signal
+	   error collapses onto x_t - x_t-1
+	B  the partial correlation - signal error with state update, controlling for
+	   stimulus change - over the 140 test compositions of the exemplar cell
+	C  Cohen's d of that partial correlation across the sweep, i.e. where
+	   error-driven updating survives the control at all
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_std'], 'pe_results.pickle'):
+	if not _require_(pe_dict, PE_CORR_KEYS, 'pe_results.pickle'):
 		return
 
 	six, nix = _example_indices_(pe_dict)
 	accent   = _model_colors_()['pred_err']
 
+	if not np.isfinite(_get_cell_(pe_dict, 'pe_sig_std', six, nix)).any():
+		print(f'  no correlation data yet at the exemplar cell '
+			  f'(noise={EXAMPLE_NOISE:g}, n={EXAMPLE_NHIDDEN}); skipping')
+		return
+
 	# Example-network series, computed on the fly (mirrors compute_pe_terms).
-	# Index i is frame t = i+1, so e_t = y_t - xhat_{t|t-1} sits against
-	# dh_t = h_t - h_{t-1}
+	# Index i is frame t = i+1, so the signal error x_t - xhat_{t|t-1} sits against
+	# dh_t = h_t - h_{t-1} and against the stimulus change x_t - x_{t-1}
 	ex   = _load_example_model_()
-	pe2  = ((ex['sample'][1:] - ex['pred'][:-1]) ** 2).mean(1)
+	sig2 = ((ex['target'][1:] - ex['pred'][:-1]) ** 2).mean(1)
+	dx2  = ((ex['target'][1:] - ex['target'][:-1]) ** 2).mean(1)
 	std2 = ((ex['hidden'][1:] - ex['hidden'][:-1]) ** 2).mean(1)
 	mask = ex['target'][1:].sum(1) > 0
 
 	fig = plt.figure(figsize=(FIG_WIDTH, 5.0))
-	gs  = fig.add_gridspec(2, 7, left=0.075, right=0.985, bottom=0.09, top=0.93,
-						   height_ratios=[1, 1.3], wspace=1.5, hspace=0.55)
+	gs  = fig.add_gridspec(2, 2, left=0.085, right=0.985, bottom=0.09, top=0.92,
+						   height_ratios=[1, 1.3], wspace=0.32, hspace=0.55)
 
-	# A - the two magnitude timecourses, z-scored over every sounding frame of the
-	# composition and then cropped, so the excerpt is on the composition's own
-	# scale rather than renormalised to whatever the window happens to contain.
-	# Silence pads between concatenated movements are blanked rather than hidden,
-	# so the gaps mark the movement boundaries
-	axA = fig.add_subplot(gs[0, :4])
-	for series, colour, label in [(pe2, '0.3', 'prediction error $||e_t||^2$'),
-								  (std2, accent, 'state update $||\\Delta h_t||^2$')]:
-		z = np.full_like(series, np.nan)
-		z[mask] = (series[mask] - series[mask].mean()) / series[mask].std()
-		axA.plot(z[:EXAMPLE_LENGTH], linewidth=0.7, color=colour, label=label)
-	axA.set_xlim(0, EXAMPLE_LENGTH)
-	# Headroom for the legend, which sits over the traces at this aspect ratio
-	axA.set_ylim(top=axA.get_ylim()[1] + 1.4)
-	axA.set_xlabel('time step', fontsize=LABEL_SIZE)
-	axA.set_ylabel('z-score', fontsize=LABEL_SIZE)
-	axA.legend(fontsize=FONT_SIZE - 1, frameon=False, loc='upper right', ncol=2,
-			   handlelength=1.2, columnspacing=1.0)
+	# A - the two candidate drivers of the state update, on shared axes. Grey for
+	# the control so the accent stays on the quantity the figure is about
+	axA = fig.add_subplot(gs[0, 0])
+	series = [(sig2, accent, 'prediction error  $x_t - \\hat{x}_{t|t-1}$'),
+			  (dx2,  '0.45', 'stimulus change  $x_t - x_{t-1}$')]
+	for values, colour, label in series:
+		r = ss.pearsonr(std2[mask], values[mask])[0]
+		axA.scatter(std2[mask], values[mask], s=3, color=colour, alpha=0.35,
+					edgecolor='none', label=f'{label}   r = {r:.2f}')
+	axA.set_xlabel('state update $||\\Delta h_t||^2$', fontsize=LABEL_SIZE)
+	axA.set_ylabel('squared magnitude', fontsize=LABEL_SIZE)
+	axA.legend(fontsize=FONT_SIZE - 2, frameon=False, loc='upper left',
+			   handletextpad=0.2, borderpad=0.1, labelspacing=0.25, markerscale=2.2)
 	_panel_label_(axA, 'A')
 
-	# B - the same two series against each other, one dot per sounding step. The
-	# whole composition is used, not just A's excerpt: the correlation is the
-	# quantity C and D aggregate, so it has to be the per-composition r they store
-	axB = fig.add_subplot(gs[0, 4:6])
-	r, p = ss.pearsonr(pe2[mask], std2[mask])
-	axB.scatter(pe2[mask], std2[mask], s=3, color=accent, alpha=0.4, edgecolor='none')
-	axB.set_xlabel('prediction error $||e_t||^2$', fontsize=LABEL_SIZE)
-	axB.set_ylabel('state update $||\\Delta h_t||^2$', fontsize=LABEL_SIZE)
-	# The per-timestep p underflows to zero for any decent correlation over
-	# hundreds of steps; report a floor rather than a meaningless exact value
-	p_str = f'p = {p:.1g}' if p > 1e-10 else 'p < 1e-10'
-	axB.set_title(f'r = {r:.2f} ({p_str})', fontsize=FONT_SIZE, pad=2)
-	_panel_label_(axB, 'B')
-
-	# C - B's correlation for all 140 test compositions of the same network. White
-	# body against the accent outline: the panel is the population B is one sample
-	# of, so it should not read as a third data series
-	axC = fig.add_subplot(gs[0, 6])
-	rs  = _get_cell_(pe_dict, 'pe_std', six, nix, run=EXAMPLE_RUN)
-	rs  = rs[np.isfinite(rs)]
-	parts = axC.violinplot([rs], positions=[0], showextrema=False, widths=0.9)
+	# B - what survives the control, per composition, at the same cell
+	axB = fig.add_subplot(gs[0, 1])
+	cols  = _per_composition_correlations_(pe_dict, six, nix, run=EXAMPLE_RUN)
+	parts = axB.violinplot([cols['partial']], positions=[0], showextrema=False,
+						   widths=0.7)
 	parts['bodies'][0].set_facecolor('white')
 	parts['bodies'][0].set_edgecolor(accent)
 	parts['bodies'][0].set_linewidth(0.8)
 	parts['bodies'][0].set_alpha(1.0)
-	axC.axhline(0, color='0.6', linewidth=0.6, linestyle='--', zorder=0)
-	# One-sample d and Wilcoxon against zero, on the same 140 compositions
-	cohens_d, p_val = _compute_stats_(rs)
-	p_txt = f'p = {p_val:.1g}' if p_val > 1e-10 else 'p < 1e-10'
-	lo, hi = axC.get_ylim()
-	axC.set_ylim(lo, hi + 0.42 * (hi - lo))
-	axC.text(0, hi + 0.20 * (hi - lo), f'd = {cohens_d:.1f}\n{p_txt}',
-			 fontsize=FONT_SIZE - 1, ha='center', va='center')
-	axC.set_xticks([])
-	axC.set_xlim(-0.7, 0.7)
-	axC.set_ylabel('r per composition', fontsize=LABEL_SIZE)
-	_panel_label_(axC, 'C')
+	axB.axhline(0, color='0.6', linewidth=0.6, linestyle='--', zorder=0)
 
-	# D - error-driven updating across the design
-	axD = fig.add_subplot(gs[1, :])
-	vals, annot = _pe_corr_map_(pe_dict)
-	_heatmap_(axD, vals, annot, vmax=1.0, noise_vals=pe_dict['noise'],
-			  n_hidden_vals=pe_dict['n_hidden'], cbar_label='mean r')
-	axD.set_title('prediction-error-driven state updating: corr(||e||², ||Δh||²)',
-				  fontsize=FONT_SIZE, pad=3)
-	_panel_label_(axD, 'D')
+	cohens_d, p_val = _compute_stats_(cols['partial'])
+	p_txt  = f'p = {p_val:.1g}' if p_val > 1e-10 else 'p < 1e-10'
+	lo, hi = axB.get_ylim()
+	axB.set_ylim(lo, hi + 0.30 * (hi - lo))
+	axB.text(0, hi + 0.14 * (hi - lo), f'd = {cohens_d:.2f} ({p_txt})',
+			 fontsize=FONT_SIZE - 1, ha='center', va='center')
+	axB.set_xticks([])
+	axB.set_xlim(-0.75, 0.75)
+	axB.set_ylabel('partial r per composition', fontsize=LABEL_SIZE)
+	axB.set_title('prediction error vs state update,\ncontrolling stimulus change',
+				  fontsize=FONT_SIZE, pad=2)
+	_panel_label_(axB, 'B')
+
+	# C - the same partial across the design, as an effect size against zero
+	axC = fig.add_subplot(gs[1, :])
+	vals, annot = _pe_partial_map_(pe_dict)
+	vmax = float(np.nanmax(np.abs(vals))) if np.isfinite(vals).any() else 1.0
+	_heatmap_(axC, vals, annot, vmax=vmax, noise_vals=pe_dict['noise'],
+			  n_hidden_vals=pe_dict['n_hidden'], cbar_label="Cohen's d")
+	axC.set_title('error-driven state updating beyond stimulus change: '
+				  "Cohen's d of the partial correlation", fontsize=FONT_SIZE, pad=3)
+	_panel_label_(axC, 'C')
 
 	_save_(fig, fname)
 
@@ -469,9 +466,10 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 
 	A  decoding the signal prediction error x_t - xhat_{t|t-1} over the 140
 	   compositions of the exemplar cell: constant vs input-only vs hidden-state
-	   decoder. The input-only rung is the critical control: the state
-	   necessarily carries the observation it has just consumed, so only
-	   state > input demonstrates encoding beyond input drive
+	   decoder, then one taking that observation and the previous one. The
+	   last rung is the critical control: the signal error is close to
+	   x_t - x_{t-1}, so a state decoder beating the current input alone could
+	   simply be remembering the previous chord
 	B  the same ladder for the expected-but-absent (omission) component, where
 	   the current input holds no trace of the error by construction
 	C  the state decoder's advantage over the input-only control for the signal
@@ -488,6 +486,13 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 	six, nix = _example_indices_(pe_dict)
 	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
 
+	# _require_ only proves the sweep holds something somewhere; panels A and B read
+	# the exemplar cell, which a partially completed sweep may not have reached
+	if not np.isfinite(_get_cell_(pe_dict, 'dec_sig_yy', six, nix)).any():
+		print(f'  no decoding data yet at the exemplar cell '
+			  f'(noise={EXAMPLE_NOISE:g}, n={EXAMPLE_NHIDDEN}); skipping')
+		return
+
 	fig = plt.figure(figsize=(FIG_WIDTH, 7.0))
 	gs  = fig.add_gridspec(3, 2, left=0.085, right=0.985, bottom=0.07, top=0.94,
 						   height_ratios=[1.15, 1, 1], wspace=0.3, hspace=0.55)
@@ -503,7 +508,9 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 		lo   = min(np.nanmin(v) for v in cols.values())
 		hi   = max(np.nanmax(v) for v in cols.values())
 		ax.set_ylim(lo - 0.15 * (hi - lo), hi + 0.55 * (hi - lo))
-		_write_stats_pair_(ax, cols, 'y', 'h', x0=1, x1=2, y=hi + 0.12 * (hi - lo))
+		# 'yy' vs 'h' is the load-bearing contrast: beating 'y' alone leaves open
+		# that the state is only remembering the previous chord
+		_write_stats_pair_(ax, cols, 'yy', 'h', x0=2, x1=3, y=hi + 0.12 * (hi - lo))
 		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
 		_panel_label_(ax, letter)
 
@@ -511,11 +518,11 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 	# input-only minus state MSE (positive = state better), run-averaged per
 	# composition
 	for row, target, letter, title in [
-			(1, 'sig', 'C', 'signal prediction error: state decoder vs input-only'),
-			(2, 'neg', 'D', 'omissions: state decoder vs input-only')]:
+			(1, 'sig', 'C', 'signal prediction error: state decoder vs input + previous'),
+			(2, 'neg', 'D', 'omissions: state decoder vs input + previous')]:
 
 		ax = fig.add_subplot(gs[row, :])
-		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_y', f'dec_{target}_h',
+		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_yy', f'dec_{target}_h',
 								   plot_cohen=True, log=True)
 		_heatmap_(ax, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
 				  cbar_label="Cohen's d (log MSE)")
@@ -750,7 +757,7 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	computed independently within every run at the exemplar cell.
 
 	A  per-run violins of the prediction-error / state-update correlation
-	B  forest of Cohen's d, input-only minus state decoding MSE (signal
+	B  forest of Cohen's d, input-plus-previous minus state decoding MSE (signal
 	   prediction error), one row per run; right of zero = state better
 	C  the same for the omission component
 	"""
@@ -763,6 +770,12 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	six, nix = _example_indices_(pe_dict)
 	runs     = _available_runs_(pe_dict, 'pe_std', six, nix)[:5]
 	accent   = _model_colors_()['pred_err']
+
+	# As in Figs 5 and 6: the sweep may hold data without having reached this cell
+	if not np.isfinite(_get_cell_(pe_dict, 'dec_sig_yy', six, nix)).any():
+		print(f'  no decoding data yet at the exemplar cell '
+			  f'(noise={EXAMPLE_NOISE:g}, n={EXAMPLE_NHIDDEN}); skipping')
+		return
 
 	fig, axs = plt.subplots(1, 3, figsize=(FIG_WIDTH, 2.9))
 	fig.subplots_adjust(left=0.09, right=0.99, bottom=0.18, top=0.90, wspace=0.45)
@@ -789,15 +802,57 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 		# compositions and understates a consistent effect (see _sweep_maps_)
 		effects, intervals = [], []
 		for r in runs:
-			y = pe_dict[f'dec_{target}_y'][six, nix, r]
+			y = pe_dict[f'dec_{target}_yy'][six, nix, r]
 			h = pe_dict[f'dec_{target}_h'][six, nix, r]
 			ok = np.isfinite(y) & np.isfinite(h) & (y > 0) & (h > 0)
 			ly, lh = np.log(y[ok]), np.log(h[ok])
 			effects.append(_compute_stats_(ly, lh)[0])
 			intervals.append(_bootstrap_ci_(ly, lh))
 		_forest_plot_(ax, effects, intervals, [f'run {r + 1}' for r in runs])
-		ax.set_xlabel("Cohen's d (log MSE, input $-$ state)", fontsize=LABEL_SIZE)
+		ax.set_xlabel("Cohen's d (log MSE, input+prev $-$ state)", fontsize=LABEL_SIZE)
 		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
+		_panel_label_(ax, letter)
+
+	_save_(fig, fname)
+
+
+def figS5_pe_controls(fname='figS5_pe-controls.pdf'):
+	"""What Fig 5D looks like before the input-drive control, and why it needs one.
+
+	A  the signal-error correlation before any control, warm nearly everywhere
+	B  the confound: how much of the state update is simply the stimulus change
+	C  the same measurement on an untrained twin of every network - random
+	   weights, no predictive power of any kind
+
+	Read together these explain why Fig 5 reports a partial correlation. Where
+	denoising is easy the state is close to a pass-through encoding of the current
+	chord, so the update follows x_t - x_{t-1} almost exactly (B); the probe's
+	prediction is close to persistence, so the signal error is that same stimulus
+	change, and A measures the two against each other. Only where B falls away does
+	A carry information about prediction.
+	"""
+	_set_plos_style_()
+
+	pe_dict = _load_pe_results_()
+	if not _require_(pe_dict, ['pe_sig_std', 'dx_std', 'pe_std_unt'], 'pe_results.pickle'):
+		return
+
+	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
+
+	fig = plt.figure(figsize=(FIG_WIDTH, 6.6))
+	gs  = fig.add_gridspec(3, 1, left=0.10, right=0.99, bottom=0.07, top=0.95,
+						   hspace=0.5)
+
+	panels = [('pe_sig_std', 'A', 'uncontrolled: corr(||$x_t-\\hat{x}$||², ||Δh||²)'),
+			  ('dx_std',     'B', 'the confound: corr(||$x_t-x_{t-1}$||², ||Δh||²)'),
+			  ('pe_std_unt', 'C', 'untrained network: corr(||e||², ||Δh||²)')]
+
+	for row, (key, letter, title) in enumerate(panels):
+		ax = fig.add_subplot(gs[row])
+		vals, annot = _pe_corr_map_(pe_dict, key=key)
+		_heatmap_(ax, vals, annot, vmax=1.0, noise_vals=noise,
+				  n_hidden_vals=n_hidden, cbar_label='mean r')
+		ax.set_title(title, fontsize=FONT_SIZE, pad=3)
 		_panel_label_(ax, letter)
 
 	_save_(fig, fname)
@@ -1261,14 +1316,14 @@ def _ladder_violins_(ax, savedict, keys, six, nix, run=None, ref_colors=None):
 
 def _decoding_violins_(ax, pe_dict, target, six, nix, run=None):
 	"""Violins of per-composition decoding MSE for the control ladder of one
-	PE target: constant, input-only, hidden state (left to right, in order of
-	the information available to each decoder). The state decoder wears the
+	PE target: constant, input-only, input-plus-previous, hidden state (left to
+	right, in order of the information available to each decoder). The state decoder wears the
 	accent, its controls grey. Returns {decoder: per-composition array}, jointly
 	NaN-filtered so the arrays stay paired for the stats brackets.
 	"""
-	greys  = {'b': '#9e9e9e', 'y': '#4d4d4d'}
+	greys  = {'b': '#9e9e9e', 'y': '#6d6d6d', 'yy': '#3d3d3d'}
 	accent = _model_colors_()['pred_err']
-	order  = ['b', 'y', 'h']
+	order  = ['b', 'y', 'yy', 'h']
 
 	arrays = {d: _get_cell_(pe_dict, f'dec_{target}_{d}', six, nix, run=run)
 			  for d in order}
@@ -1423,6 +1478,68 @@ def _pe_corr_map_(pe_dict, key='pe_std'):
 		values[j, i] = r.mean()
 		text = _value_annot_(values[j, i])
 		annot[j, i]  = f'({text})' if pval * bonferroni > 0.05 else text
+
+	return values, annot
+
+
+def _per_composition_correlations_(pe_dict, six, nix, run=None):
+	"""Per-composition correlations for one cell, raw and controlled.
+
+	Returns {'raw', 'dx', 'partial'}, jointly NaN-filtered so the arrays stay
+	paired for violins and stats:
+
+	  raw      corr(||x_t - xhat||^2, ||dh_t||^2)
+	  dx       corr(||x_t - x_t-1||^2, ||dh_t||^2)
+	  partial  the first, controlling for the stimulus change
+
+	The control is not optional. When denoising is easy the state update follows
+	the stimulus change almost exactly (r = 0.98 at sigma = 0.001) and the probe's
+	prediction is close to persistence, so the signal error is *also* the stimulus
+	change and the raw correlation measures nothing. Only the partial separates
+	error-driven updating from the stimulus moving.
+	"""
+	r_ed, r_dd, r_ex = (_get_cell_(pe_dict, k, six, nix, run=run)
+						for k in ('pe_sig_std', 'dx_std', 'pe_sig_dx'))
+
+	ok = np.isfinite(r_ed) & np.isfinite(r_dd) & np.isfinite(r_ex)
+	r_ed, r_dd, r_ex = r_ed[ok], r_dd[ok], r_ex[ok]
+
+	denom   = np.sqrt((1 - r_ex ** 2) * (1 - r_dd ** 2))
+	partial = (r_ed - r_ex * r_dd) / np.where(denom > 0, denom, np.nan)
+
+	good = np.isfinite(partial)
+
+	return {'raw': r_ed[good], 'dx': r_dd[good], 'partial': partial[good]}
+
+
+def _pe_partial_map_(pe_dict):
+	"""Cohen's d of the partial correlation per sweep cell, (n_hidden, noise).
+
+	One-sample d against zero over the 140 compositions, run-averaged per
+	composition first (matching _get_cell_'s convention). d rather than mean r
+	because the partial is a residual quantity: what matters is whether it is
+	reliably above zero across compositions, not its absolute size. Annotations are
+	parenthesised where the one-sample Wilcoxon does not survive Bonferroni over
+	the finite cells.
+	"""
+	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
+
+	values = np.full((len(n_hidden), len(noise)), np.nan)
+	annot  = np.full(values.shape, '', dtype=object)
+
+	finite = [(i, j) for i in range(len(noise)) for j in range(len(n_hidden))
+			  if np.isfinite(_get_cell_(pe_dict, 'pe_sig_std', i, j)).any()]
+	bonferroni = max(len(finite), 1)
+
+	for i, j in finite:
+		partial = _per_composition_correlations_(pe_dict, i, j)['partial']
+		if partial.size < 2:
+			continue
+
+		cohens_d, pval = _compute_stats_(partial)
+		values[j, i] = cohens_d
+		text = _value_annot_(cohens_d)
+		annot[j, i] = f'({text})' if pval * bonferroni > 0.05 else text
 
 	return values, annot
 

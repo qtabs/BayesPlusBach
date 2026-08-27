@@ -359,6 +359,15 @@ class Bachmodel():
 		          error, so this part cannot be reconstructed from the current
 		          observation alone - the model analogue of omission responses
 		  y_next  y_t, the features of the input-only control decoder
+		  y_prev  y_{t-1}; with y_next it forms the input-plus-previous
+		          decoder, the control for reconstructing the error from the
+		          last two observations rather than from a prediction
+		  dx      x_t - x_{t-1}: the stimulus change. The state update tracks
+		          this almost perfectly when denoising is easy (r = 0.98 at
+		          sigma = 0.001), and a persistence-like prediction makes pe_sig
+		          the same quantity, so the two correlate without any
+		          prediction-error coding. Every correlation reported for
+		          pe_sig has to be partialled on it
 		  stm     h_t;  std  dh_t = h_t - h_{t-1}
 		  mask    frames where x_t contains any active pitch class. False
 		          on the silence padding inserted between concatenated
@@ -376,32 +385,45 @@ class Bachmodel():
 
 		p      = pred[0, :-1]
 		y_next = sample[0, 1:]
+		y_prev = sample[0, :-1]
 		x_next = target[0, 1:]
+		x_prev = target[0, :-1]
 
 		return {'pe_raw': y_next - p,
 				'pe_sig': x_next - p,
 				'pe_neg': np.maximum(p - x_next, 0),
 				'y_next': y_next,
+				'y_prev': y_prev,
+				'dx'    : x_next - x_prev,
 				'stm'   : hidden[0, 1:],
 				'std'   : hidden[0, 1:] - hidden[0, :-1],
 				'mask'  : x_next.sum(1) > 0}
 
-	def test_globaldist_model(self):
-		
+	def global_distribution(self):
+		"""Per-note marginal P(note on) over the training corpus.
+
+		This is the optimal constant predictor under BCELoss (independent
+		Bernoullis; do NOT normalise to sum to 1), i.e. the prediction of the
+		global-distribution rung of the reference ladder. It depends on the clean
+		targets alone, so it is the same at every noise level - callers that sweep
+		over noise should compute it once and reuse it.
+		"""
 		with torch.no_grad():
-			# Compute global distribution from training set
 			train_chunker = Chunker(self.train_path, 1, None, self.chromatic, self.noise, self.dev, seed=EVAL_SEED)
 			train_operas  = sorted(train_chunker.song_pool)
 
 			glob_dist = torch.zeros(self.net.n_dim).to(self.dev)
-			
+
 			for opera in train_operas:
 				glob_dist += train_chunker.read_song_as_tensor(opera)['target'].mean((0, 1))
 
-			# Per-note marginal P(note on): optimal constant predictor under BCELoss.
-			# (Independent Bernoullis; do NOT normalise to sum to 1.)
 			glob_dist *= 1/len(train_operas)
-			glob_dist  = glob_dist.clamp(1e-6, 1 - 1e-6)
+
+			return glob_dist.clamp(1e-6, 1 - 1e-6)
+
+	def test_globaldist_model(self):
+
+		glob_dist = self.global_distribution()
 
 		# Measure performance in the testing set
 		with torch.no_grad():

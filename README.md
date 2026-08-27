@@ -25,7 +25,7 @@ Driver script that runs the experiments end to end:
 - `main_fitting()`: trains a GRU first on denoising (prediction readout frozen), then trains the prediction readout on top of the frozen recurrent weights, and reports observation and prediction errors.
 - `baselines()`: fits the reference models used as upper/lower bounds — the memory-less logistic decoder, the global note distribution, first-order Markov with noisy or ground-truth input, and a GRU trained directly to predict. These estimate properties of the task rather than of any one network, so they are computed once per noise level at saturated capacity instead of being width-matched to each RNN of the sweep.
 - `pipeline()` and `baselines_pipeline()`: sweep noise levels × hidden-unit counts × runs, calling the above and storing results in `results/results.pickle`. Both are resumable — finished cells are checkpointed on disk and reloaded rather than refitted, so an interrupted sweep continues where it stopped.
-- `prediction_error_analysis_pipeline()`: for each fitted model, correlates the prediction-error magnitude with the state-update magnitude, then decodes each prediction-error target from a constant, from the input alone, and from the hidden state. Writes `results/pe_results.pickle` with `pe_std` plus one entry per target × decoder pair (`dec_{raw,sig,neg}_{b,x,h}`), resuming per cell.
+- `prediction_error_analysis_pipeline()`: for each fitted model, correlates the prediction-error magnitude with the state-update magnitude, together with the stimulus-change term needed to partial it — when denoising is easy the update simply follows `x_t − x_{t−1}` and the probe's prediction is close to persistence, so the uncontrolled correlation measures the two against each other — then decodes each prediction-error target from a constant, from the current input, from the current plus previous input, and from the hidden state. Work is split into four independently resumable groups, so a new measurement can be added to a finished sweep without refitting what is already stored. Writes `results/pe_results.pickle` with `pe_std` plus one entry per target × decoder pair (`dec_{raw,sig,neg}_{b,x,h}`), resuming per cell.
 
 ### `figures.py` ###
 
@@ -37,14 +37,15 @@ Figure factory for the manuscript. Every `figNN_*` (main) and `figSN_*` (supplem
 | Fig 2 | prediction emerges — single network |
 | Fig 3 | prediction error against noise, at the exemplar size |
 | Fig 4 | the prediction contrasts across the sweep |
-| Fig 5 | prediction errors drive the state update |
+| Fig 5 | prediction errors drive the state update, beyond stimulus change |
 | Fig 6 | prediction errors are decodable from the state |
 | S1 | training loss timecourses |
 | S2 | decoding across the sweep |
 | S3 | the prediction effect replicates across the five runs |
 | S4 | PE encoding replicates across the five runs |
+| S5 | the uncontrolled PE correlation, the stimulus-change confound, and an untrained twin |
 
-The prediction-error figures (5, 6, S4) read `results/pe_results.pickle`. Their design answers the input-drive confound: the state necessarily encodes the observation it has just consumed, so PE encoding is only claimed where a state decoder beats an input-only control — most stringently for the omission component, which the current input cannot carry. Every figure guards on what it needs and plots only what is present, so the module stays runnable while any analysis output is missing. All figures are laid out to PLOS Computational Biology specifications: full column width (7.5 in), Arial at 8–10 pt, fonts embedded as TrueType. The PDFs are build products and are not tracked.
+The prediction-error figures (5, 6, S4, S5) read `results/pe_results.pickle`. Their design answers the input-drive confound: the state necessarily encodes the observation it has just consumed, so PE encoding is only claimed where a state decoder beats an input-only control — most stringently for the omission component, which the current input cannot carry. Every figure guards on what it needs and plots only what is present, so the module stays runnable while any analysis output is missing. All figures are laid out to PLOS Computational Biology specifications: full column width (7.5 in), Arial at 8–10 pt, fonts embedded as TrueType. The PDFs are build products and are not tracked.
 
 ### `run_pipeline.sh` ###
 
