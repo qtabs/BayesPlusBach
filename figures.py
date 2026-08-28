@@ -762,12 +762,11 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	A  per-run violins of the prediction-error / state-update correlation
 	B  forest of Cohen's d, input-plus-previous minus state decoding MSE (signal
 	   prediction error), one row per run; right of zero = state better
-	C  the same for the omission component
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, ['pe_std'] + PE_DECODING_KEYS, 'pe_results.pickle'):
+	if not _require_(pe_dict, ['pe_std', 'dec_sig_yy', 'dec_sig_h'], 'pe_results.pickle'):
 		return
 
 	six, nix = _example_indices_(pe_dict)
@@ -780,8 +779,8 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 			  f'(noise={EXAMPLE_NOISE:g}, n={EXAMPLE_NHIDDEN}); skipping')
 		return
 
-	fig, axs = plt.subplots(1, 3, figsize=(FIG_WIDTH, 2.9))
-	fig.subplots_adjust(left=0.09, right=0.99, bottom=0.18, top=0.90, wspace=0.45)
+	fig, axs = plt.subplots(1, 2, figsize=(FIG_WIDTH, 2.9))
+	fig.subplots_adjust(left=0.09, right=0.99, bottom=0.18, top=0.90, wspace=0.30)
 
 	# A - the correlation, per run
 	rs = [pe_dict['pe_std'][six, nix, r] for r in runs]
@@ -798,23 +797,21 @@ def figS4_pe_reliability(fname='figS4_pe-reliability.pdf'):
 	axs[0].set_ylabel('corr(||e||², ||Δh||²) per composition', fontsize=LABEL_SIZE)
 	_panel_label_(axs[0], 'A')
 
-	# B, C - the decoding contrast per run: d of paired input-only minus state MSE
-	for ax, target, letter, title in [(axs[1], 'sig', 'B', 'signal prediction error'),
-									  (axs[2], 'neg', 'C', 'omissions')]:
-		# Log MSE, matching Fig 6: the raw scale is heavy-tailed across
-		# compositions and understates a consistent effect (see _sweep_maps_)
-		effects, intervals = [], []
-		for r in runs:
-			y = pe_dict[f'dec_{target}_yy'][six, nix, r]
-			h = pe_dict[f'dec_{target}_h'][six, nix, r]
-			ok = np.isfinite(y) & np.isfinite(h) & (y > 0) & (h > 0)
-			ly, lh = np.log(y[ok]), np.log(h[ok])
-			effects.append(_compute_stats_(ly, lh)[0])
-			intervals.append(_bootstrap_ci_(ly, lh))
-		_forest_plot_(ax, effects, intervals, [f'run {r + 1}' for r in runs])
-		ax.set_xlabel("Cohen's d (log MSE, input+prev $-$ state)", fontsize=LABEL_SIZE)
-		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
-		_panel_label_(ax, letter)
+	# B - the decoding contrast per run: d of paired input-plus-previous minus state
+	# MSE. Log MSE, matching Fig 6: the raw scale is heavy-tailed across
+	# compositions and understates a consistent effect (see _sweep_maps_)
+	effects, intervals = [], []
+	for r in runs:
+		y = pe_dict['dec_sig_yy'][six, nix, r]
+		h = pe_dict['dec_sig_h'][six, nix, r]
+		ok = np.isfinite(y) & np.isfinite(h) & (y > 0) & (h > 0)
+		ly, lh = np.log(y[ok]), np.log(h[ok])
+		effects.append(_compute_stats_(ly, lh)[0])
+		intervals.append(_bootstrap_ci_(ly, lh))
+	_forest_plot_(axs[1], effects, intervals, [f'run {r + 1}' for r in runs])
+	axs[1].set_xlabel("Cohen's d (log MSE, input+prev $-$ state)", fontsize=LABEL_SIZE)
+	axs[1].set_title('signal prediction error', fontsize=FONT_SIZE, pad=2)
+	_panel_label_(axs[1], 'B')
 
 	_save_(fig, fname)
 
