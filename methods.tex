@@ -1,0 +1,48 @@
+\section*{Methods}
+
+  \subsection*{Data}
+
+    MIDI files were scraped from seven public archives\footnote{jsbach.net, metronimo.com, piano-midi.de, sound.jp/bach-ken, dardel.info, classicalarchives.com, and suzumidi.com.} and matched to their BWV catalogue number; duplicates across archives were further removed. Files sharing a BWV number (different movements or arrangements of the same work) were concatenated into a single composition, separated by 20 silent tokens. The 700 compositions were split by BWV number rather than by file, so that no movement of a test composition was ever seen during training.
+
+    Noise realisations were drawn independently at every presentation of a training chunk, which makes the effective training set unbounded and prevents the networks from memorising a particular noise combination. In contrast, the noise realisations used to generate observations for the validation and test sets were used consistently during the evaluation of the models and benchmarks, using seeds based on their BWV number.
+
+  \subsection*{Target networks}
+
+    The recurrent networks were single-layer gated recurrent units (GRU)~\cite{cho2014gru} with the hidden state initialised to zero at the beginning of each composition. Both readouts were affine maps followed by an
+    element-wise sigmoid, and their outputs were clamped to $[10^{-6}, 1-10^{-6}]$. Since targets were compositional (i.e., a single target $x_t$ usually had more than one active element), outputs were treated as $12$ independent Bernoulli probabilities rather than as a distribution over chords and scored with the mean binary cross-entropy (BCE) over dimensions and time steps.
+
+    Both training stages used Adam~\cite{kingma2015adam} with a learning rate of $0.02$ on batches of $512$ sequences of $512$ tokens: $20{,}000$ batches for denoising and $3{,}000$ for the prediction readout. In the first training stage the prediction head was frozen at its random initialisation and did not contribute to the gradient; in the second stage, the recurrent weights and the denoising head were frozen and only the prediction head was fitted, so that the hidden dynamics of the RNN were identical to those learned during the denoising objective. The batch budget was fixed so that every cell of the design received the same amount of training. However, validation error was evaluated every $100$ batches and the parameters were restored to the best-scoring checkpoint at the end of each stage. Every combination of noise amplitude and network size was trained five times from independent initialisations, resulting in a total of $14 \times 6 \times 5 = 420$ networks. Unless otherwise specified, results reported for a single network correspond to the first of the five trainings, and results reported across the design are averaged over the five trainings within each composition before aggregation. The two agree closely for the prediction and decoding contrasts (Cohen's $d = 0.92$--$0.97$ and $d = 3.46$--$4.27$ across trainings at the case-example cell); the partial correlations of Figure~\ref{fig:pe} are more variable ($r = 0.12$--$0.23$).
+
+  \subsection*{Benchmark models}
+
+    The two Markovian benchmarks and the memory-less denoising benchmark were fitted as $12$ independent logistic regressions, one per each of the 12 dimensions (pitch classes), on the training compositions. We used negligible regularisation ($C = 10^{6}$). Dimensions that were never active in the training set were assigned their clamped marginal frequency instead of a fitted regression.
+
+    The marginal predictor uses the per-dimension frequency over the training set (a constant vector) as prediction, computed by averaging each composition's frequency so that compositions rather than tokens are weighted equally. This is the optimal constant vector prediction in the sense that it minimises binary cross-entropy.
+
+    The prediction-trained network was a GRU with $N = 256$, trained end-to-end on the prediction objective with the same learning rate, batch size and chunk size as the target networks, over a single stage of $25{,}000$ batches.
+
+  \subsection*{Partial correlations}
+
+    All the per-timestep series were aligned on the predicted token: index $t$ refers to the token whose prediction $\hat{x}_{t|t-1}$ was formed from the state $h_{t-1}$. Squared magnitudes were averaged over their components, over the 12 dimensions for the error terms and over the $N$ units for the state update, so that they are comparable across network sizes.
+
+    Partial correlations between prediction error $e$ and state update $\Delta$ given the change in the latent tokens $\delta$ were computed as $\rho_{e, \Delta \mid \delta} = \frac{\rho_{e,\Delta} - \rho_{e,\delta} \, \rho_{\Delta, \delta}}{\sqrt{(1 - \rho_{e,\delta}^{2})(1 - \rho_{\Delta, \delta}^{2})}}$, where $\rho_{x,y}$ is the Pearson's correlation between $x$ and $y$. Since the latents are binary, $\delta$ takes only the twelve values $k/12$ given by the number of dimensions that changed, and the expression above therefore removes the linear component of a discrete control. Replacing it with indicator variables for each level, with separate onset and offset counts, or with the full 12-dimensional change vector altered $\rho_{e, \Delta \mid \delta}$ by less than $0.02$ at every noise amplitude tested.
+
+    Silent tokens were excluded from all the prediction-error analyses, since a state that has been idling through silence otherwise couples the series spuriously.
+
+  \subsection*{Prediction error decoders}
+
+    The prediction-error decoders were ridge regressions fitted on the validation set. Penalties were selected per output dimension by leave-one-out cross-validation over seven values spanning $10^{-3}$ to $10^{3}$. 
+
+    The three benchmark decoders used to contextualise the performance of the decoders were fitted on the same data with the same procedure and differ only in their inputs.
+
+  \subsection*{Statistical analyses}
+
+    The composition was the unit of analysis in every test ($n = 140$). Significance was assessed using Wilcoxon signed-rank tests, and effect sizes are reported as Cohen's $d$. Values reported in heatmaps across all combinations of network size and noise levels were Bonferroni-corrected over the $84$ cells of the design.
+
+    Decoding errors were compared on a logarithmic scale. The binary cross-entropies of the prediction and denoising analyses are bounded and well behaved, and were compared on their raw scale.
+
+  \subsection*{Implementation}
+
+    Models were implemented in PyTorch~\cite{paszke2019pytorch}. MIDI parsing was performed with mido. Benchmark models and statistical analyses used scikit-learn~\cite{pedregosa2011sklearn} and SciPy.
+
+    The corpus retrieval, training, benchmarking and analysis code, together with the fitted weights and the analysis outputs, is available at \url{https://github.com/qtabs/BayesPlusBach}.
