@@ -371,7 +371,13 @@ class Bachmodel():
 		  stm     h_t;  std  dh_t = h_t - h_{t-1}
 		  mask    frames where x_t contains any active pitch class. False
 		          on the silence padding inserted between concatenated
-		          movements, which otherwise couples all series spuriously
+		          movements, which otherwise couples all series spuriously.
+		          The first sounding frame *after* such a gap is kept, and
+		          there dx is the whole chord rather than a real transition:
+		          131 of the 491,177 masked test frames (0.03%, in 49 of the
+		          140 compositions). Excluding them moves the partial
+		          correlation of Fig 5 by less than 1e-4, so they are left in
+		          rather than complicating the mask
 		"""
 		with torch.no_grad():
 
