@@ -11,6 +11,7 @@ pipeline_run.log
 
 # Manuscript sources are kept outside the repo
 docs/
+*.tex
 
 # Figures are rebuilt by figures.py; only the pickles they read are tracked
 results/*.pdf
