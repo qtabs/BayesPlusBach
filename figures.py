@@ -379,8 +379,9 @@ def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
 	   error collapses onto x_t - x_t-1
 	B  the partial correlation - signal error with state update, controlling for
 	   stimulus change - over the 140 test compositions of the exemplar cell
-	C  Cohen's d of that partial correlation across the sweep, i.e. where
-	   error-driven updating survives the control at all
+	C  that partial correlation across the sweep - colour and the upper number are
+	   the mean per-composition r, the lower number its one-sample Cohen's d
+	   (parenthesised where the Wilcoxon misses Bonferroni-corrected significance)
 	"""
 	_set_plos_style_()
 
@@ -451,11 +452,14 @@ def fig05_pe_state_updating(fname='fig05_pe-state-updating.pdf'):
 	# C - the same partial across the design, as an effect size against zero
 	axC = fig.add_subplot(gs[1, :])
 	vals, annot = _pe_partial_map_(pe_dict)
+	# Scaled to the data: the partial is a residual and never approaches 1, so a
+	# fixed +/-1 scale would wash the whole map out
 	vmax = float(np.nanmax(np.abs(vals))) if np.isfinite(vals).any() else 1.0
 	_heatmap_(axC, vals, annot, vmax=vmax, noise_vals=pe_dict['noise'],
-			  n_hidden_vals=pe_dict['n_hidden'], cbar_label="Cohen's d")
-	axC.set_title('error-driven state updating beyond stimulus change: '
-				  "Cohen's d of the partial correlation", fontsize=FONT_SIZE, pad=3)
+			  n_hidden_vals=pe_dict['n_hidden'], cbar_label='mean partial r',
+			  linespacing=1.9)
+	axC.set_title('error-driven state updating beyond stimulus change: partial '
+				  "correlation (mean r, Cohen's d below)", fontsize=FONT_SIZE, pad=3)
 	_panel_label_(axC, 'C')
 
 	_save_(fig, fname)
@@ -1513,14 +1517,18 @@ def _per_composition_correlations_(pe_dict, six, nix, run=None):
 
 
 def _pe_partial_map_(pe_dict):
-	"""Cohen's d of the partial correlation per sweep cell, (n_hidden, noise).
+	"""Partial correlation per sweep cell, (n_hidden, noise), with its effect size.
 
-	One-sample d against zero over the 140 compositions, run-averaged per
-	composition first (matching _get_cell_'s convention). d rather than mean r
-	because the partial is a residual quantity: what matters is whether it is
-	reliably above zero across compositions, not its absolute size. Annotations are
-	parenthesised where the one-sample Wilcoxon does not survive Bonferroni over
-	the finite cells.
+	Colour and the first annotation line carry the mean per-composition partial r,
+	run-averaged per composition first (matching _get_cell_'s convention). The
+	second line carries the one-sample Cohen's d against zero, parenthesised where
+	the one-sample Wilcoxon does not survive Bonferroni over the finite cells.
+
+	Both are shown because they rank the sweep differently: d is mean over standard
+	deviation, so a small but very consistent partial outranks a larger, noisier
+	one. At sigma = 0.001 the eight-unit networks reach d = 4.7 on a mean r of only
+	0.22, and reading d alone would put the strongest effect in the corner where the
+	prediction carries no information at all.
 	"""
 	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
 
@@ -1537,9 +1545,12 @@ def _pe_partial_map_(pe_dict):
 			continue
 
 		cohens_d, pval = _compute_stats_(partial)
-		values[j, i] = cohens_d
-		text = _value_annot_(cohens_d)
-		annot[j, i] = f'({text})' if pval * bonferroni > 0.05 else text
+		values[j, i] = partial.mean()
+
+		d_text = _value_annot_(cohens_d)
+		if pval * bonferroni > 0.05:
+			d_text = f'({d_text})'
+		annot[j, i] = f'{_value_annot_(values[j, i])}\n{d_text}'
 
 	return values, annot
 
@@ -1581,7 +1592,7 @@ def _mean_sem_vs_noise_(savedict, key, nix):
 
 
 def _heatmap_(ax, values, annot, vmax, noise_vals, n_hidden_vals, cbar_label,
-			  cbar=True):
+			  cbar=True, linespacing=None):
 	"""Noise x n_hidden map of an effect size or a raw difference.
 
 	Rows are network sizes, columns noise levels, matching plot_perfomance_summary
@@ -1590,8 +1601,14 @@ def _heatmap_(ax, values, annot, vmax, noise_vals, n_hidden_vals, cbar_label,
 	+/-vmax; the exact value and its significance stay legible in the annotation
 	(e.g. decoding d blows up where the memoryless ANN has near-zero variance).
 	"""
+	# linespacing is only passed for the two-line annotations of Fig 5C, where the
+	# cell carries the value on top and its effect size below
+	annot_kws = {'fontsize': FONT_SIZE - 3}
+	if linespacing is not None:
+		annot_kws['linespacing'] = linespacing
+
 	sns.heatmap(values, cmap='RdBu_r', center=0, vmin=-vmax, vmax=vmax, ax=ax,
-				annot=annot, fmt='', annot_kws={'fontsize': FONT_SIZE - 3},
+				annot=annot, fmt='', annot_kws=annot_kws,
 				linewidths=0.3, linecolor='white', square=False, cbar=cbar,
 				cbar_kws={'pad': 0.02, 'label': cbar_label},
 				xticklabels=[f'{n:g}' for n in noise_vals], yticklabels=n_hidden_vals)
