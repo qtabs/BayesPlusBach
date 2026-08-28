@@ -473,69 +473,64 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 	"""The prediction error is decodable from the state, beyond input drive.
 
 	A  decoding the signal prediction error x_t - xhat_{t|t-1} over the 140
-	   compositions of the exemplar cell: constant vs input-only vs hidden-state
-	   decoder, then one taking that observation and the previous one. The
-	   last rung is the critical control: the signal error is close to
-	   x_t - x_{t-1}, so a state decoder beating the current input alone could
-	   simply be remembering the previous chord
-	B  the same ladder for the expected-but-absent (omission) component, where
-	   the current input holds no trace of the error by construction
-	C  the state decoder's advantage over the input-only control for the signal
-	   prediction error across the sweep (Cohen's d of the paired MSE
-	   difference; warm = state better)
-	D  the same for the omission component
+	   compositions of the exemplar cell, along a ladder ordered by the
+	   information each decoder has: a constant, the observation just consumed,
+	   that observation and the previous one, and the hidden state. The third
+	   rung is the critical control - the signal error is close to x_t - x_{t-1},
+	   so a state decoder beating the current input alone could simply be
+	   remembering the previous chord
+	B  the state decoder's advantage over that control across the sweep (Cohen's
+	   d of the paired MSE difference; warm = state better)
 	"""
 	_set_plos_style_()
 
 	pe_dict = _load_pe_results_()
-	if not _require_(pe_dict, PE_DECODING_KEYS, 'pe_results.pickle'):
+	if not _require_(pe_dict, [f'dec_sig_{d}' for d in ('b', 'y', 'yy', 'h')],
+					 'pe_results.pickle'):
 		return
 
 	six, nix = _example_indices_(pe_dict)
 	noise, n_hidden = pe_dict['noise'], pe_dict['n_hidden']
 
-	# _require_ only proves the sweep holds something somewhere; panels A and B read
-	# the exemplar cell, which a partially completed sweep may not have reached
+	# _require_ only proves the sweep holds something somewhere; panel A reads the
+	# exemplar cell, which a partially completed sweep may not have reached
 	if not np.isfinite(_get_cell_(pe_dict, 'dec_sig_yy', six, nix)).any():
 		print(f'  no decoding data yet at the exemplar cell '
 			  f'(noise={EXAMPLE_NOISE:g}, n={EXAMPLE_NHIDDEN}); skipping')
 		return
 
-	fig = plt.figure(figsize=(FIG_WIDTH, 7.0))
-	gs  = fig.add_gridspec(3, 2, left=0.085, right=0.985, bottom=0.07, top=0.94,
-						   height_ratios=[1.15, 1, 1], wspace=0.3, hspace=0.55)
+	fig = plt.figure(figsize=(FIG_WIDTH, 4.5))
+	gs  = fig.add_gridspec(2, 3, left=0.085, right=0.985, bottom=0.11, top=0.93,
+						   height_ratios=[1, 1], width_ratios=[1, 2.2, 1],
+						   hspace=0.42)
 
-	# A, B - decoding ladders at the exemplar cell (single network, run 0)
-	for col, target, letter, title in [
-			(0, 'sig', 'A', 'signal prediction error  $x_t - \\hat{x}_{t|t-1}$'),
-			(1, 'neg', 'B', 'omissions  $(\\hat{x}_{t|t-1} - x_t)_+$')]:
+	# A - the decoding ladder at the exemplar cell (single network, run 0). Placed
+	# in the middle column: four violins stretched over the full page width read as
+	# a trend across a continuum rather than as four separate decoders
+	axA = fig.add_subplot(gs[0, 1])
+	# cols holds log MSE, so the bracket reports the log-scale effect size
+	cols = _decoding_violins_(axA, pe_dict, 'sig', six, nix, run=EXAMPLE_RUN)
+	lo   = min(np.nanmin(v) for v in cols.values())
+	hi   = max(np.nanmax(v) for v in cols.values())
+	axA.set_ylim(lo - 0.15 * (hi - lo), hi + 0.55 * (hi - lo))
+	# 'yy' vs 'h' is the load-bearing contrast: beating 'y' alone leaves open that
+	# the state is only remembering the previous chord
+	_write_stats_pair_(axA, cols, 'yy', 'h', x0=2, x1=3, y=hi + 0.12 * (hi - lo))
+	axA.set_title('signal prediction error  $x_t - \\hat{x}_{t|t-1}$',
+				  fontsize=FONT_SIZE, pad=2)
+	_panel_label_(axA, 'A')
 
-		ax = fig.add_subplot(gs[0, col])
-		# cols holds log MSE, so the bracket reports the log-scale effect size
-		cols = _decoding_violins_(ax, pe_dict, target, six, nix, run=EXAMPLE_RUN)
-		lo   = min(np.nanmin(v) for v in cols.values())
-		hi   = max(np.nanmax(v) for v in cols.values())
-		ax.set_ylim(lo - 0.15 * (hi - lo), hi + 0.55 * (hi - lo))
-		# 'yy' vs 'h' is the load-bearing contrast: beating 'y' alone leaves open
-		# that the state is only remembering the previous chord
-		_write_stats_pair_(ax, cols, 'yy', 'h', x0=2, x1=3, y=hi + 0.12 * (hi - lo))
-		ax.set_title(title, fontsize=FONT_SIZE, pad=2)
-		_panel_label_(ax, letter)
-
-	# C, D - decoding beyond input drive across the design: paired Cohen's d of
-	# input-only minus state MSE (positive = state better), run-averaged per
+	# B - the same contrast across the design: paired Cohen's d of input-plus-
+	# previous minus state MSE (positive = state better), run-averaged per
 	# composition
-	for row, target, letter, title in [
-			(1, 'sig', 'C', 'signal prediction error: state decoder vs input + previous'),
-			(2, 'neg', 'D', 'omissions: state decoder vs input + previous')]:
-
-		ax = fig.add_subplot(gs[row, :])
-		vals, annot = _sweep_maps_(pe_dict, f'dec_{target}_yy', f'dec_{target}_h',
-								   plot_cohen=True, log=True)
-		_heatmap_(ax, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
-				  cbar_label="Cohen's d (log MSE)")
-		ax.set_title(title, fontsize=FONT_SIZE, pad=3)
-		_panel_label_(ax, letter)
+	axB = fig.add_subplot(gs[1, :])
+	vals, annot = _sweep_maps_(pe_dict, 'dec_sig_yy', 'dec_sig_h',
+							   plot_cohen=True, log=True)
+	_heatmap_(axB, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
+			  cbar_label="Cohen's d (log MSE)")
+	axB.set_title('signal prediction error: state decoder vs input + previous',
+				  fontsize=FONT_SIZE, pad=3)
+	_panel_label_(axB, 'B')
 
 	_save_(fig, fname)
 
@@ -1353,7 +1348,13 @@ def _decoding_violins_(ax, pe_dict, target, six, nix, run=None):
 		body.set_alpha(0.6)
 
 	lo, hi = min(v.min() for v in cols.values()), max(v.max() for v in cols.values())
-	ticks  = [t for t in [1e-4, 1e-3, 1e-2, 1e-1, 1e0] if lo - 0.5 <= np.log(t) <= hi + 0.5]
+	decades = [1e-4, 1e-3, 1e-2, 1e-1, 1e0]
+	ticks   = [t for t in decades if lo - 0.5 <= np.log(t) <= hi + 0.5]
+	# A ladder spanning less than a decade leaves a single labelled tick, which
+	# reads as an unscaled axis; fall back to 1-2-5 steps inside the data range
+	if len(ticks) < 2:
+		ticks = sorted(t for d in decades for m in (1, 2, 5)
+					   for t in [m * d] if lo <= np.log(t) <= hi)
 	ax.set_yticks(np.log(ticks))
 	ax.set_yticklabels([f'{t:g}' for t in ticks])
 
