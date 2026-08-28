@@ -1682,6 +1682,17 @@ def _load_example_model_(noise=EXAMPLE_NOISE, n_hidden=EXAMPLE_NHIDDEN,
 			'hidden': as_np(hidden)}
 
 
+# Supplementary figures cut from the manuscript. S3 and S4 asked whether the
+# effects replicate across the five runs, which the Results now state as a range in
+# text; S5 justified Fig 5's control, which Fig 5A already shows at the exemplar.
+# The builders are kept rather than deleted - the analyses behind them are still in
+# results.pickle and pe_results.pickle - so restoring one is a matter of taking its
+# name out of this set
+RETIRED_FIGURES = {'figS3_prediction_reliability',
+				   'figS4_pe_reliability',
+				   'figS5_pe_controls'}
+
+
 def make_all_figures():
 
 	# Main figures are figNN_<name>, supplementary ones figSN_<name>; sorting puts
@@ -1689,7 +1700,8 @@ def make_all_figures():
 	is_figure = re.compile(r'^fig(S?\d{1,2})_').match
 
 	figure_funcs = sorted(name for name in globals()
-						  if is_figure(name) and callable(globals()[name]))
+						  if is_figure(name) and callable(globals()[name])
+						  and name not in RETIRED_FIGURES)
 
 	for name in figure_funcs:
 		print(f'\n{name}')
