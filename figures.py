@@ -70,11 +70,15 @@ PE_RESULTS  = './results/pe_results.pickle'
 
 # The cell shown by every single-network figure. Kept here rather than passed as
 # arguments so that all example panels are guaranteed to describe the same network.
-# sigma sits just inside the regime where prediction emerges (the RNN starts
-# beating Markov-high around sigma = 0.15) while decoding is still largely intact -
-# neither effect is visible at the near-noiseless control, where the RNN barely
-# edges Markov-high and the piano rolls look clean
-EXAMPLE_NOISE   = 0.2
+# sigma sits inside the band where all three analyses agree the effects live: the
+# RNN starts beating Markov-high around sigma = 0.15, the state decoder starts
+# beating input-plus-previous there too, and the stimulus-change-controlled
+# correlation of Fig 5 rises out of zero at sigma = 0.25. Below that band the
+# denoising task is easy enough that the state is close to a pass-through encoding
+# of the current chord, so the correlation measures stimulus change and the state
+# decoder loses outright to input-plus-previous; above it everything decays with
+# the prediction itself
+EXAMPLE_NOISE   = 0.25
 EXAMPLE_NHIDDEN = 64
 EXAMPLE_RUN     = 0
 EXAMPLE_OPERA   = 14
