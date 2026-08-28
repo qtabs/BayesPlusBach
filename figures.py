@@ -525,7 +525,7 @@ def fig06_pe_decoding(fname='fig06_pe-decoding.pdf'):
 	# composition
 	axB = fig.add_subplot(gs[1, :])
 	vals, annot = _sweep_maps_(pe_dict, 'dec_sig_yy', 'dec_sig_h',
-							   plot_cohen=True, log=True)
+							   plot_cohen=True, log=True, run=EXAMPLE_RUN)
 	_heatmap_(axB, vals, annot, vmax=4.5, noise_vals=noise, n_hidden_vals=n_hidden,
 			  cbar_label="Cohen's d (log MSE)")
 	axB.set_title('signal prediction error: state decoder vs input + previous',
@@ -1407,7 +1407,7 @@ def _reference_scatter_(ax, rnn, refs, contrasts, ref_colors, lims=None,
 	return lims
 
 
-def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False):
+def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False, run=None):
 	"""Per-cell contrast of the RNN against a reference over the whole sweep.
 
 	Returns (values, annot), both (n_hidden, noise) with hidden units on the rows
@@ -1424,6 +1424,9 @@ def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False):
 	every composition. On the log scale d is a standardised log-ratio, robust to
 	that outlier and comparable across noise levels. The BCE contrasts of Figs 4
 	and S2 are bounded and well behaved, and stay on the raw scale.
+
+	`run` selects a single training run instead of averaging the per-composition
+	values across runs, for figures whose other panels show one network.
 	"""
 	noise, n_hidden = savedict['noise'], savedict['n_hidden']
 	shape = (len(n_hidden), len(noise))
@@ -1432,15 +1435,15 @@ def _sweep_maps_(savedict, ref_key, rnn_key, plot_cohen, log=False):
 	annot  = np.full(shape, '', dtype=object)
 
 	finite = [(i, j) for i in range(len(noise)) for j in range(len(n_hidden))
-			  if np.isfinite(_get_cell_(savedict, rnn_key, i, j)).any()]
+			  if np.isfinite(_get_cell_(savedict, rnn_key, i, j, run=run)).any()]
 	bonferroni = max(len(finite), 1)
 
 	# With 14 noise levels a per-cell "d (p=..)" string is unreadable, and almost
 	# every cell is significant anyway. Annotate the value alone and flag the rare
 	# non-significant cell by parenthesising it (caption: parentheses = n.s.)
 	for i, j in finite:
-		rnn = _get_cell_(savedict, rnn_key, i, j)   # runs-averaged (140,)
-		ref = _get_cell_(savedict, ref_key, i, j)   # reference (140,)
+		rnn = _get_cell_(savedict, rnn_key, i, j, run=run)   # (140,)
+		ref = _get_cell_(savedict, ref_key, i, j, run=run)   # reference (140,)
 
 		ok = np.isfinite(rnn) & np.isfinite(ref)
 		if log:
